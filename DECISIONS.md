@@ -28,3 +28,28 @@ software cannot fix them.
 The other stations do not need a visit: S06 needs its clock setting changed, S07 its
 wind unit setting, S02 a calibration kit, S08 a SIM top-up, and S05's humidity fixed
 itself.
+
+## 02 My least certain call: Pick the decision in flags.csv you are least sure about. What is the evidenceeach way, and what single piece of information would settle it?
+
+My least certain call is the S04 daytime temperature bias (exclude daytime readings
+from 26 March).
+
+Evidence that it is a real fault:
+- The error only happens in the daytime; nights are fine. A shield that does not let
+  air through only goes wrong when the sun is shining on it.
+- Only S04 shows it, so it is probably S04's equipment, not the weather.
+- It started after the post was repainted on 15 March.
+
+Evidence against:
+- The error grows slowly, week by week. If paint had blocked the slats on 15 March,
+  I would expect a sudden jump on that day, not a slow climb.
+- The start date (26 March) is only an estimate from a 7-day average.
+- S04 is in a garden, so the warmth could be real — for example soil drying out or
+  walls heating up in spring sun.
+- The note says the paint is white, and white paint alone should not make the sensor
+  warmer — only paint blocking the slats would.
+
+What would settle it: one side-by-side reading. The technician holds a hand
+thermometer in the shade next to the shield on a sunny afternoon and compares it with
+the station's reading at the same time. If they match, the shield is fine and the
+warmth is real. If the station reads higher, the shield is faulty.
