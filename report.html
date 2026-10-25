@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Spring weather network — data note</title>
+<style>
+:root{--ink:#24312d;--muted:#58655f;--paper:#fffdf7;--rule:#c8cec4;--green:#345c4b;--pale:#edf2e9;--amber:#f4edda}
+*{box-sizing:border-box}body{margin:0;background:#e9e8e0;color:var(--ink);font:11pt/1.32 Georgia,"Times New Roman",serif}
+.memo{width:210mm;min-height:297mm;margin:18px auto;padding:13mm 15mm;background:var(--paper);box-shadow:0 3px 18px #0002}
+header{border-bottom:2px solid var(--green);padding-bottom:8px;margin-bottom:10px}.eyebrow{font:bold 8.5pt Arial,sans-serif;letter-spacing:.12em;text-transform:uppercase;color:var(--green)}
+h1{margin:5px 0;font-size:24pt;line-height:1.05;font-weight:normal;letter-spacing:-.02em}.dek{margin:0;color:var(--muted);font-size:10pt}
+h2{font-size:13.5pt;margin:10px 0 5px;color:var(--green);font-weight:normal}p{margin:4px 0 6px}
+.decision{border-left:4px solid var(--green);background:var(--pale);padding:7px 10px;margin:6px 0 8px}.decision strong{font-size:12pt}
+ul{margin:3px 0 5px 18px;padding:0}li{margin:2px 0}.runner{border-top:1px solid var(--rule);padding-top:5px;margin-top:6px}
+.fixes{display:grid;grid-template-columns:1fr 1fr;gap:3px 14px;margin:4px 0 6px}.fixes p{margin:0;padding:3px 0;border-bottom:1px dotted var(--rule);font-size:9pt}
+.real{background:var(--amber);padding:6px 9px;margin:6px 0}
+table{width:100%;border-collapse:collapse;table-layout:fixed;font:7.9pt/1.2 Arial,sans-serif;margin-top:5px}
+th,td{border:1px solid var(--rule);padding:4px 3px;vertical-align:top;overflow-wrap:anywhere}th{background:#e8eee5;color:#243b30;text-align:left}
+th:first-child,td:first-child{width:7%;font-weight:bold}td{background:#fffef9}
+.use{color:#315b45;font-weight:bold}.fix{color:#74551b;font-weight:bold}.out{color:#8a3c32;font-weight:bold}
+.legend{font:8pt Arial,sans-serif;color:var(--muted);margin:4px 0 0}
+footer{border-top:1px solid var(--rule);margin-top:8px;padding-top:5px;color:var(--muted);font:7.7pt Arial,sans-serif;display:flex;justify-content:space-between;gap:10px}
+@page{size:A4;margin:0}
+@media print{body{background:white;font-size:9.5pt}.memo{margin:0;width:auto;min-height:0;padding:9mm 11mm;box-shadow:none}h1{font-size:21pt}h2{font-size:12pt;margin-top:8px}.decision{padding:5px 8px;margin:5px 0}.fixes p{font-size:8.4pt;padding:2px 0}table{font-size:7.2pt;line-height:1.13}th,td{padding:3px 2.5px}footer{margin-top:6px}}
+</style></head><body><main class="memo">
+<header><div class="eyebrow">Field note · Spring climate summary</div><h1>Eight stations, a few repairs</h1><p class="dek">For the network coordinator · Read before the spring figures are shared</p></header>
+<h2>Where should the technician go?</h2>
+<div class="decision"><strong>Send the technician to S04 — Foothills Community Garden.</strong>
+<p>The daytime temperature has been reading too warm, with the difference growing since late March. The pattern points to a radiation shield that may have become blocked after the 15 March repaint. Its rain gauge also appears to have been blocked by leaves.</p>
+<ul><li>Check the shield slats first and clear any obstruction.</li><li>Compare the station reading with a hand thermometer held in the shade.</li><li>Fit a leaf guard, then test the rain gauge with a measured cup of water.</li></ul></div>
+<p class="runner"><strong>Runner-up: S03.</strong> Its temperature sensor is failing, but the errors are obvious and have been marked for automatic removal. S04 is the better use of the one-hour visit because both temperature and rainfall need attention.</p>
+<h2>What can go into the spring climate summary?</h2>
+<p>Use this as a quick guide. “Use after fix” means apply the correction first. “Leave out” applies only to the dates shown; other readings from that station can still be used.</p>
+<table aria-label="Station by weather measure data-use guide"><thead><tr><th>Station</th><th>Temperature</th><th>Humidity</th><th>Pressure</th><th>Wind</th><th>Rain</th><th>Sunlight</th></tr></thead><tbody>
+<tr><td>S01</td><td><span class="use">use</span><br>Cold is altitude-related</td><td class="use">use</td><td class="use">use</td><td class="use">use</td><td><span class="use">use</span><br>Snowmelt is real</td><td class="use">use</td></tr>
+<tr><td>S02</td><td class="use">use</td><td class="use">use</td><td><span class="fix">use after fix</span><br>Subtract 6.7 hPa</td><td class="use">use</td><td class="use">use</td><td class="use">use</td></tr>
+<tr><td>S03</td><td><span class="out">leave out</span><br>5 Mar, 12 Mar, 2 &amp; 8 Apr; 18–21 Mar</td><td class="use">use</td><td class="use">use</td><td class="use">use</td><td class="use">use</td><td class="use">use</td></tr>
+<tr><td>S04</td><td><span class="out">leave out daytime readings</span><br>26 Mar–11 Apr</td><td class="use">use</td><td class="use">use</td><td class="use">use</td><td><span class="out">leave out</span><br>23 Mar–2 Apr; discard 2 Apr burst</td><td class="use">use</td></tr>
+<tr><td>S05</td><td class="use">use</td><td><span class="out">leave out</span><br>7–11 Mar</td><td class="use">use</td><td class="use">use</td><td class="use">use</td><td class="use">use</td></tr>
+<tr><td>S06</td><td><span class="fix">use after fix</span><br>Clock corrected</td><td class="fix">use after fix</td><td class="fix">use after fix</td><td class="fix">use after fix</td><td class="fix">use after fix</td><td class="fix">use after fix</td></tr>
+<tr><td>S07</td><td class="use">use</td><td class="use">use</td><td class="use">use</td><td><span class="fix">use after fix</span><br>Multiply by 3.6 from 26 Mar 15:40 UTC</td><td class="use">use</td><td class="use">use</td></tr>
+<tr><td>S08</td><td><span class="out">leave out</span><br>16 Mar 14:00–18 Mar 01:30</td><td class="out">leave out</td><td class="out">leave out</td><td class="out">leave out</td><td class="out">leave out</td><td class="out">leave out</td></tr>
+</tbody></table>
+<p class="legend"><span class="use">use</span> = suitable as recorded · <span class="fix">use after fix</span> = correct first · <span class="out">leave out</span> = do not use the named period. S08’s repeated row has been removed; the gap cannot be filled from this record.</p>
+<h2>Already fixed in the data</h2><div class="fixes">
+<p><strong>S06 · Clock:</strong> timestamps shifted by +6 hours to UTC.</p><p><strong>S07 · Wind:</strong> readings from 26 March 15:40 UTC onward multiplied by 3.6.</p>
+<p><strong>S02 · Pressure:</strong> subtract 6.7 hPa from 21 March 17:20 onward.</p><p><strong>S08 · Records:</strong> repeated copy removed; missing period marked unusable.</p>
+<p><strong>S05 · Location:</strong> correct the station position in the station list; readings themselves are fine.</p></div>
+<h2>Looks wrong, but is real</h2><div class="real"><p><strong>S01 is much colder than the others</strong> because it sits high up (2,913 metres). Once altitude is allowed for, its temperature is in line with the network. Keep it.</p>
+<p><strong>S01’s rain on otherwise dry days is likely snowmelt.</strong> Those days had below-freezing minimum temperatures, so keep the rain-gauge readings rather than treating them as a fault.</p></div>
+<footer><span>Based on the supplied quality flags for 1 March–11 April 2025.</span><span>Working note · For coordinator review</span></footer>
+</main></body></html>
