@@ -96,3 +96,21 @@ Refuse to automate:
 - Deleting raw data. Always keep the original and store corrections separately, so
   any mistake can be checked and undone.
 - Choosing where the technician goes. That needs local knowledge and judgement.
+
+## 05 By hand: solar noon at S04 on 20 March 2025
+
+S04's longitude from stations.csv is -105.146, which means 105.146 degrees west
+of Greenwich.
+
+The Earth turns 360 degrees in 24 hours, so 15 degrees per hour, or 4 minutes per
+degree. At Greenwich (0 degrees) the sun is highest at about 12:00 UTC.
+
+105.146 x 4 = 420.6 minutes = about 7 hours 1 minute.
+So the sun reaches its highest point at S04 about 7 hours after Greenwich:
+12:00 + 7:01 = about 19:01 UTC.
+
+Why this is useful: it is a way to check a station's clock without GPS. Sunlight
+should peak around 19:08 UTC at S04. If a station's sunlight peaks at a very
+different time, its clock is wrong. That is what happened at S06: after 24 March
+its sunlight peaked about 6 hours early in the file, matching its clock being
+6 hours behind.
