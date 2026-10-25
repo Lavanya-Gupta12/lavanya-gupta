@@ -31,8 +31,8 @@ itself.
 
 ## 02 My least certain call: Pick the decision in flags.csv you are least sure about. What is the evidenceeach way, and what single piece of information would settle it?
 
-My least certain call is the S04 daytime temperature bias (exclude daytime readings
-from 26 March).
+My least certain call is the S04 daytime temperature bias (excluding daytime readings
+from 26 March, because those shouldn't be included in the spring summary until they are first checked to be wrong or right).
 
 Evidence that it is a real fault:
 - The error only happens in the daytime; nights are fine. A shield that does not let
