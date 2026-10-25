@@ -1,1 +1,2 @@
-chatgpt link : https://chatgpt.com/c/6addbf58-90a0-83ee-8201-8dfde9ecb707
+chatgpt link : 
+https://chatgpt.com/c/6addbf58-90a0-83ee-8201-8dfde9ecb707
