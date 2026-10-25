@@ -2,7 +2,6 @@
 import sys
 import re
 from pathlib import Path
-from collections import defaultdict
 
 import numpy as np
 import pandas as pd
@@ -20,7 +19,7 @@ OUTPUT_COLUMNS = [
 
 
 def parse_nmea_checksum(sentence):
-    """Return True if an NMEA sentence has a valid XOR checksum."""
+    """Validate the XOR checksum of an NMEA sentence."""
     sentence = sentence.strip()
 
     if not sentence.startswith("$") or "*" not in sentence:
@@ -39,13 +38,17 @@ def parse_nmea_checksum(sentence):
 
 
 def parse_nmea_time(value):
-    """Parse NMEA hhmmss.ss into a time of day."""
-    match = re.fullmatch(r"(\d{2})(\d{2})(\d{2}(?:\.\d+)?)", value.strip())
+    """Convert NMEA hhmmss.ss into seconds since midnight."""
+    match = re.fullmatch(
+        r"(\d{2})(\d{2})(\d{2}(?:\.\d+)?)",
+        value.strip(),
+    )
 
     if not match:
         return None
 
-    hour, minute = int(match.group(1)), int(match.group(2))
+    hour = int(match.group(1))
+    minute = int(match.group(2))
     seconds = float(match.group(3))
 
     if hour > 23 or minute > 59 or seconds >= 60:
@@ -55,107 +58,48 @@ def parse_nmea_time(value):
 
 
 def parse_nmea_date(value):
-    """Parse RMC date ddmmyy using the conventional NMEA year pivot."""
+    """Convert RMC ddmmyy into a UTC-midnight timestamp."""
     if not re.fullmatch(r"\d{6}", value.strip()):
         return None
 
-    day, month, year = int(value[:2]), int(value[2:4]), int(value[4:6])
+    day = int(value[:2])
+    month = int(value[2:4])
+    year = int(value[4:6])
     year += 2000 if year < 80 else 1900
 
     try:
-        return pd.Timestamp(year=year, month=month, day=day)
+        return pd.Timestamp(
+            year=year, month=month, day=day, tz="UTC"
+        )
     except ValueError:
         return None
 
 
-def parse_gps_file(path):
-    """
-    Read logger_timestamp,$GPRMC or $GPGGA sentence records.
-    Only checksum-valid RMC records with status A establish GPS UTC.
-    """
-    records = []
-
-    if not path.exists():
-        return pd.DataFrame(
-            columns=["logger_time", "gps_time", "sentence_type"]
-        )
-
-    with path.open("r", encoding="utf-8-sig", errors="replace") as file:
-        for line in file:
-            line = line.strip()
-
-            if not line:
-                continue
-
-            parts = line.split(",", 1)
-            if len(parts) != 2:
-                continue
-
-            logger_time = pd.to_datetime(
-                parts[0].strip(), errors="coerce", utc=True
-            )
-            sentence = parts[1].strip()
-
-            if pd.isna(logger_time) or not parse_nmea_checksum(sentence):
-                continue
-
-            fields = sentence[1:sentence.rfind("*")].split(",")
-            sentence_type = fields[0] if fields else ""
-
-            if sentence_type == "GPRMC":
-                if len(fields) < 10 or fields[2].strip() != "A":
-                    continue
-
-                seconds = parse_nmea_time(fields[1])
-                date = parse_nmea_date(fields[9])
-
-                if seconds is None or date is None:
-                    continue
-
-                midnight = date.tz_localize("UTC")
-                gps_time = midnight + pd.to_timedelta(seconds, unit="s")
-
-                # RMC dates are authoritative; do not silently replace them
-                # with the logger date.
-                records.append({
-                    "logger_time": logger_time,
-                    "gps_time": gps_time,
-                    "sentence_type": "GPRMC",
-                })
-
-            elif sentence_type == "GPGGA":
-                # GGA has no date. It cannot independently establish UTC.
-                # Checksum-valid GGA records are intentionally not used
-                # to estimate the logger's UTC offset.
-                continue
-
-    result = pd.DataFrame(records)
-
-    if result.empty:
-        return pd.DataFrame(
-            columns=["logger_time", "gps_time", "sentence_type"]
-        )
-
-    return result.sort_values("logger_time", kind="stable").reset_index(drop=True)
-
-
 def format_utc(value):
-    """Format a timestamp in UTC to YYYY-MM-DD HH:MM."""
-    if pd.isna(value):
+    """Format a timestamp as YYYY-MM-DD HH:MM in UTC."""
+    if value is None or pd.isna(value):
         return ""
 
-    value = pd.Timestamp(value)
+    timestamp = pd.Timestamp(value)
 
-    if value.tzinfo is None:
-        value = value.tz_localize("UTC")
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.tz_localize("UTC")
     else:
-        value = value.tz_convert("UTC")
+        timestamp = timestamp.tz_convert("UTC")
 
-    return value.strftime("%Y-%m-%d %H:%M")
+    return timestamp.strftime("%Y-%m-%d %H:%M")
 
 
-def add_flag(flags, station_id, channel, start, end,
-             issue, action, note):
+def add_flag(
+    flags,
+    station_id,
+    channel,
+    start,
+    end,
+    issue,
+    action,
+    note,
+):
     flags.append({
         "station_id": str(station_id),
         "channel": channel,
@@ -167,24 +111,96 @@ def add_flag(flags, station_id, channel, start, end,
     })
 
 
-def split_clock_jumps(df):
+def load_gps(path):
     """
-    Split chronologically ordered file rows whenever the logger timestamp
-    moves backwards. Each resulting segment is independently clock-checked.
+    Read GPS records in file order.
+
+    Valid RMC records with status A provide authoritative GPS UTC.
+    GGA records are checksum-validated but cannot establish a date.
+    Invalid sentences are ignored.
     """
-    if df.empty:
-        return []
+    records = []
 
-    timestamps = df["timestamp_utc"]
-    valid = timestamps.notna()
+    if not path.exists():
+        return pd.DataFrame(
+            columns=[
+                "gps_row",
+                "logger_time",
+                "gps_time",
+                "sentence_type",
+            ]
+        )
 
+    with path.open(
+        "r", encoding="utf-8-sig", errors="replace"
+    ) as file:
+        for gps_row, line in enumerate(file):
+            line = line.strip()
+
+            if not line:
+                continue
+
+            parts = line.split(",", 1)
+
+            if len(parts) != 2:
+                continue
+
+            logger_time = pd.to_datetime(
+                parts[0].strip(), errors="coerce", utc=True
+            )
+            sentence = parts[1].strip()
+
+            if pd.isna(logger_time):
+                continue
+
+            if not parse_nmea_checksum(sentence):
+                continue
+
+            body = sentence[1:sentence.rfind("*")]
+            fields = body.split(",")
+            sentence_type = fields[0] if fields else ""
+
+            if sentence_type != "GPRMC":
+                continue
+
+            if len(fields) < 10 or fields[2].strip() != "A":
+                continue
+
+            seconds = parse_nmea_time(fields[1])
+            date = parse_nmea_date(fields[9])
+
+            if seconds is None or date is None:
+                continue
+
+            gps_time = date + pd.to_timedelta(seconds, unit="s")
+
+            records.append({
+                "gps_row": gps_row,
+                "logger_time": logger_time,
+                "gps_time": gps_time,
+                "sentence_type": sentence_type,
+            })
+
+    return pd.DataFrame(records, columns=[
+        "gps_row",
+        "logger_time",
+        "gps_time",
+        "sentence_type",
+    ])
+
+
+def split_weather_segments(df):
+    """
+    Split original file-order rows at every backward timestamp jump.
+    Invalid timestamps break the sequence.
+    """
     segments = []
     current = []
     previous = None
 
-    for index in df.index:
-        timestamp = timestamps.loc[index]
-
+    for index, timestamp in zip(
+        df.index, df["timestamp_utc"]
+    ):
         if pd.isna(timestamp):
             if current:
                 segments.append(current)
@@ -205,8 +221,234 @@ def split_clock_jumps(df):
     return segments
 
 
-def process_station(station_id, data_path, gps_path,
-                    interval_minutes, flags):
+def split_gps_segments(gps):
+    """
+    Split GPS records in file order at backward jumps in logger time.
+    """
+    if gps.empty:
+        return []
+
+    segments = []
+    current = []
+    previous = None
+
+    for index, row in gps.iterrows():
+        timestamp = row["logger_time"]
+
+        if previous is not None and timestamp < previous:
+            segments.append(current)
+            current = []
+
+        current.append(index)
+        previous = timestamp
+
+    if current:
+        segments.append(current)
+
+    return segments
+
+
+def estimate_segment_offset(weather, gps, tolerance_seconds):
+    """
+    Match weather rows to GPS rows by segment position and nearest
+    logger timestamp within that segment.
+
+    Return median(logger time - GPS time) in seconds, or None if
+    insufficient matching GPS evidence exists.
+    """
+    if weather.empty or gps.empty:
+        return None
+
+    weather = weather.sort_values(
+        "_file_row", kind="stable"
+    ).copy()
+
+    gps = gps.sort_values("gps_row", kind="stable").copy()
+
+    # Match on logger timestamps within this segment only.
+    # This prevents a later local-time segment from matching an earlier
+    # UTC segment merely because their timestamps overlap.
+    left = weather[
+        ["_file_row", "timestamp_utc"]
+    ].sort_values("timestamp_utc")
+
+    right = gps[
+        ["logger_time", "gps_time", "gps_row"]
+    ].sort_values("logger_time")
+
+    matched = pd.merge_asof(
+        left,
+        right,
+        left_on="timestamp_utc",
+        right_on="logger_time",
+        direction="nearest",
+        tolerance=pd.Timedelta(seconds=tolerance_seconds),
+    )
+
+    matched = matched.dropna(subset=["gps_time"])
+
+    if matched.empty:
+        return None
+
+    offsets = (
+        matched["timestamp_utc"] - matched["gps_time"]
+    ).dt.total_seconds()
+
+    offsets = offsets.replace([np.inf, -np.inf], np.nan).dropna()
+
+    if offsets.empty:
+        return None
+
+    return float(np.median(offsets))
+
+
+def flag_duplicate_rows(df, station_id, flags):
+    """
+    Flag exact repeated copies, grouping consecutive repeated rows
+    into a single flag with a row count.
+
+    The original row is retained. A repeated copy is flagged as
+    correct with the required note.
+    """
+    if df.empty:
+        return df
+
+    value_columns = [
+        col for col in df.columns
+        if col not in {"_file_row", "_segment"}
+    ]
+
+    duplicate_mask = df.duplicated(
+        subset=value_columns, keep="first"
+    )
+
+    duplicate_indices = df.index[duplicate_mask].tolist()
+
+    if not duplicate_indices:
+        return df
+
+    # Consecutive duplicate records are grouped by adjacent source-row
+    # positions. Non-consecutive repetitions remain separate groups.
+    groups = []
+    current = [duplicate_indices[0]]
+
+    for index in duplicate_indices[1:]:
+        previous = current[-1]
+
+        if index == previous + 1:
+            current.append(index)
+        else:
+            groups.append(current)
+            current = [index]
+
+    groups.append(current)
+
+    for group in groups:
+        first_time = df.loc[group[0], "_corrected_timestamp"]
+        last_time = df.loc[group[-1], "_corrected_timestamp"]
+
+        add_flag(
+            flags,
+            station_id,
+            "all",
+            first_time,
+            last_time,
+            "exact duplicate row(s)",
+            "correct",
+            f"drop the repeated copy; {len(group)} repeated row(s).",
+        )
+
+    return df.drop(index=duplicate_indices).copy()
+
+
+def flag_conflicting_timestamps(df, station_id, flags):
+    """
+    Exclude rows sharing corrected UTC timestamps when their values
+    differ. Exact duplicates should already have been removed.
+    """
+    if df.empty:
+        return df
+
+    conflicting = df[
+        df.duplicated("_corrected_timestamp", keep=False)
+    ]
+
+    if conflicting.empty:
+        return df
+
+    conflicting_times = sorted(
+        conflicting["_corrected_timestamp"].unique()
+    )
+
+    for timestamp in conflicting_times:
+        timestamp = pd.Timestamp(timestamp)
+
+        add_flag(
+            flags,
+            station_id,
+            "all",
+            timestamp,
+            timestamp,
+            "conflicting duplicate timestamp",
+            "exclude",
+            "Different readings share the same corrected UTC timestamp.",
+        )
+
+    return df[
+        ~df["_corrected_timestamp"].isin(conflicting_times)
+    ].copy()
+
+
+def flag_gaps(df, station_id, interval_minutes, flags):
+    """Flag missing expected intervals after clock correction."""
+    if len(df) < 2:
+        return
+
+    df = df.sort_values(
+        "_corrected_timestamp", kind="stable"
+    ).reset_index(drop=True)
+
+    expected = pd.Timedelta(minutes=interval_minutes)
+
+    for i in range(1, len(df)):
+        previous = df.loc[i - 1, "_corrected_timestamp"]
+        current = df.loc[i, "_corrected_timestamp"]
+
+        delta = current - previous
+
+        if delta <= expected * 1.5:
+            continue
+
+        # Expected missing sample times, not the bounding observations.
+        missing_start = previous + expected
+        missing_end = current - expected
+
+        if missing_start > missing_end:
+            continue
+
+        add_flag(
+            flags,
+            station_id,
+            "all",
+            missing_start,
+            missing_end,
+            "missing logger interval(s)",
+            "exclude",
+            (
+                f"Expected {interval_minutes:g}-minute sampling; "
+                f"the gap between valid observations is "
+                f"{delta.total_seconds() / 60:g} minutes."
+            ),
+        )
+
+
+def process_station(
+    station_id,
+    data_path,
+    gps_path,
+    interval_minutes,
+    flags,
+):
     if not data_path.exists():
         add_flag(
             flags, station_id, "all", pd.NaT, pd.NaT,
@@ -216,16 +458,16 @@ def process_station(station_id, data_path, gps_path,
         return
 
     try:
-        df = pd.read_csv(data_path)
+        raw = pd.read_csv(data_path)
     except Exception as exc:
         add_flag(
             flags, station_id, "all", pd.NaT, pd.NaT,
             "unreadable station data file", "exclude",
-            f"Could not read the CSV file: {exc}",
+            f"Could not read station CSV: {exc}",
         )
         return
 
-    if "timestamp_utc" not in df.columns:
+    if "timestamp_utc" not in raw.columns:
         add_flag(
             flags, station_id, "metadata", pd.NaT, pd.NaT,
             "missing timestamp column", "exclude",
@@ -233,201 +475,155 @@ def process_station(station_id, data_path, gps_path,
         )
         return
 
-    df["_original_row"] = np.arange(len(df))
-    df["timestamp_utc"] = pd.to_datetime(
-        df["timestamp_utc"], errors="coerce", utc=True
+    raw["_file_row"] = np.arange(len(raw))
+    raw["timestamp_utc"] = pd.to_datetime(
+        raw["timestamp_utc"], errors="coerce", utc=True
     )
 
-    # A timestamp that cannot be parsed cannot be assigned a reliable
-    # UTC interval.
-    for index in df.index[df["timestamp_utc"].isna()]:
+    invalid = raw[raw["timestamp_utc"].isna()]
+
+    for _, row in invalid.iterrows():
         add_flag(
             flags, station_id, "all", pd.NaT, pd.NaT,
             "invalid logger timestamp", "exclude",
-            f"Timestamp in CSV row {index + 2} could not be parsed.",
+            f"CSV row {int(row['_file_row']) + 2} has an invalid timestamp.",
         )
 
-    valid_df = df.loc[df["timestamp_utc"].notna()].copy()
+    raw = raw[raw["timestamp_utc"].notna()].copy()
 
-    if valid_df.empty:
+    if raw.empty:
         return
 
-    # Exact duplicates are rows identical across all original columns.
-    # A repeated copy is flagged as correct; retain the first occurrence.
-    original_columns = [
-        col for col in df.columns
-        if col != "_original_row"
+    # Split BEFORE any duplicate handling, so a clock reset cannot
+    # disappear when overlapping timestamps are removed.
+    weather_segments = split_weather_segments(raw)
+    gps = load_gps(gps_path)
+    gps_segment_indices = split_gps_segments(gps)
+
+    gps_segments = [
+        gps.loc[indices].copy()
+        for indices in gps_segment_indices
     ]
-    duplicate_mask = valid_df.duplicated(
-        subset=original_columns, keep="first"
-    )
 
-    for index in valid_df.index[duplicate_mask]:
-        timestamp = valid_df.at[index, "timestamp_utc"]
-        add_flag(
-            flags, station_id, "all", timestamp, timestamp,
-            "exact duplicate row", "correct",
-            "drop the repeated copy",
-        )
+    interval_seconds = interval_minutes * 60.0
+    tolerance_seconds = max(120.0, interval_seconds * 0.5)
 
-    valid_df = valid_df.loc[~duplicate_mask].copy()
+    corrected_segments = []
 
-    # Distinct records with the same timestamp are ambiguous. Flag every
-    # conflicting timestamp group and exclude the observations at that time.
-    conflicting_times = set(
-        valid_df.loc[
-            valid_df.duplicated("timestamp_utc", keep=False),
-            "timestamp_utc",
-        ].tolist()
-    )
-
-    for timestamp in sorted(conflicting_times):
-        add_flag(
-            flags, station_id, "all", timestamp, timestamp,
-            "conflicting duplicate timestamp", "exclude",
-            "Multiple rows share this timestamp but contain different values.",
-        )
-
-    valid_df = valid_df.loc[
-        ~valid_df["timestamp_utc"].isin(conflicting_times)
-    ].copy()
-
-    if valid_df.empty:
-        return
-
-    # Read valid GPS time observations. Match each logger record to its
-    # closest RMC logger timestamp, using a tolerance based on the sampling
-    # interval. Each logger-clock segment is estimated separately.
-    gps = parse_gps_file(gps_path)
-
-    valid_df = valid_df.sort_values(
-        "_original_row", kind="stable"
-    ).copy()
-
-    segments = split_clock_jumps(valid_df)
-
-    corrected_parts = []
-
-    interval_seconds = float(interval_minutes) * 60.0
-    gps_tolerance_seconds = max(120.0, interval_seconds * 0.5)
-
-    for segment_number, indices in enumerate(segments, start=1):
-        segment = valid_df.loc[indices].copy()
+    for segment_number, indices in enumerate(
+        weather_segments
+    ):
+        segment = raw.loc[indices].copy()
+        segment["_segment"] = segment_number
         segment["_corrected_timestamp"] = segment["timestamp_utc"]
 
-        if not gps.empty:
-            segment_start = segment["timestamp_utc"].min()
-            segment_end = segment["timestamp_utc"].max()
+        # Match each weather segment to the GPS segment with the closest
+        # file-order position. Logger timestamps alone are insufficient
+        # when both clocks jump or move to local time.
+        gps_segment = pd.DataFrame()
 
-            candidates = gps.loc[
-                gps["logger_time"].between(
-                    segment_start - pd.Timedelta(seconds=gps_tolerance_seconds),
-                    segment_end + pd.Timedelta(seconds=gps_tolerance_seconds),
-                )
-            ].copy()
+        if gps_segments:
+            weather_position = float(
+                segment["_file_row"].median()
+            )
 
-            if not candidates.empty:
-                # Match each station timestamp to the nearest GPS logger
-                # timestamp. Use each valid GPS fix at most once.
-                left = segment[["_original_row", "timestamp_utc"]].copy()
-                left = left.sort_values("timestamp_utc")
-
-                right = candidates[
-                    ["logger_time", "gps_time"]
-                ].sort_values("logger_time")
-
-                matched = pd.merge_asof(
-                    left,
-                    right,
-                    left_on="timestamp_utc",
-                    right_on="logger_time",
-                    direction="nearest",
-                    tolerance=pd.Timedelta(
-                        seconds=gps_tolerance_seconds
-                    ),
+            def gps_distance(candidate):
+                return abs(
+                    float(candidate["gps_row"].median())
+                    - weather_position
                 )
 
-                matched = matched.dropna(subset=["gps_time"])
+            # GPS and weather files need not contain the same number of
+            # rows. Select by normalized position in their respective
+            # files, then estimate the offset using timestamp matches.
+            weather_fraction = (
+                weather_position / max(len(raw) - 1, 1)
+            )
 
-                if not matched.empty:
-                    offsets = (
-                        matched["timestamp_utc"] - matched["gps_time"]
-                    ).dt.total_seconds()
-
-                    offset_seconds = float(np.median(offsets))
-
-                    # Correct only when the median logger-GPS offset is
-                    # at least two minutes in magnitude.
-                    if abs(offset_seconds) >= 120.0:
-                        shift = pd.to_timedelta(
-                            offset_seconds, unit="s"
-                        )
-
-                        segment["_corrected_timestamp"] = (
-                            segment["timestamp_utc"] - shift
-                        )
-
-                        add_flag(
-                            flags,
-                            station_id,
-                            "timestamp_utc",
-                            segment["_corrected_timestamp"].min(),
-                            segment["_corrected_timestamp"].max(),
-                            "logger clock offset",
-                            "correct",
-                            (
-                                f"Shifted timestamps by "
-                                f"{-offset_seconds:.1f} seconds; "
-                                f"median logger-minus-RMC offset was "
-                                f"{offset_seconds:.1f} seconds in "
-                                f"clock segment {segment_number}."
-                            ),
-                        )
-
-        corrected_parts.append(segment)
-
-    corrected = pd.concat(corrected_parts, ignore_index=True)
-
-    # Check sampling gaps after clock correction. Sort by true corrected UTC
-    # time; do not bridge invalid timestamps or invent missing measurements.
-    corrected = corrected.sort_values(
-        "_corrected_timestamp", kind="stable"
-    ).reset_index(drop=True)
-
-    corrected_times = corrected["_corrected_timestamp"]
-    expected = pd.Timedelta(minutes=float(interval_minutes))
-
-    if len(corrected) >= 2:
-        for i in range(1, len(corrected)):
-            previous = corrected_times.iloc[i - 1]
-            current = corrected_times.iloc[i]
-
-            delta = current - previous
-
-            if delta > expected * 1.5:
-                # Report the expected missing slots between observations.
-                missing_start = previous + expected
-                missing_end = current - expected
-
-                add_flag(
-                    flags,
-                    station_id,
-                    "all",
-                    missing_start,
-                    missing_end,
-                    "missing logger interval(s)",
-                    "exclude",
-                    (
-                        f"Expected {interval_minutes:g}-minute sampling; "
-                        f"observed a {delta.total_seconds() / 60.0:g}-"
-                        f"minute gap between valid timestamps."
-                    ),
+            distances = []
+            for candidate in gps_segments:
+                gps_position = float(candidate["gps_row"].median())
+                gps_fraction = gps_position / max(
+                    int(gps["gps_row"].max()), 1
                 )
+                distances.append(
+                    abs(weather_fraction - gps_fraction)
+                )
+
+            candidate_index = int(np.argmin(distances))
+            gps_segment = gps_segments[candidate_index]
+
+        offset_seconds = estimate_segment_offset(
+            segment,
+            gps_segment,
+            tolerance_seconds,
+        )
+
+        # Require the two-minute threshold and use the segment's median
+        # logger-minus-GPS offset.
+        if (
+            offset_seconds is not None
+            and abs(offset_seconds) >= 120.0
+        ):
+            shift = pd.to_timedelta(offset_seconds, unit="s")
+
+            segment["_corrected_timestamp"] = (
+                segment["timestamp_utc"] - shift
+            )
+
+            add_flag(
+                flags,
+                station_id,
+                "timestamp_utc",
+                segment["_corrected_timestamp"].min(),
+                segment["_corrected_timestamp"].max(),
+                "logger clock offset",
+                "correct",
+                (
+                    f"Shifted timestamps by {-offset_seconds:.1f} seconds; "
+                    f"median logger-minus-RMC offset was "
+                    f"{offset_seconds:.1f} seconds in clock segment "
+                    f"{segment_number + 1}."
+                ),
+            )
+
+        corrected_segments.append(segment)
+
+    if not corrected_segments:
+        return
+
+    corrected = pd.concat(
+        corrected_segments, ignore_index=True
+    )
+
+    # Check duplicates only after each segment has its corrected UTC times.
+    # Preserve original measurement columns for exact-row comparison.
+    corrected = flag_duplicate_rows(
+        corrected, station_id, flags
+    )
+
+    corrected = flag_conflicting_timestamps(
+        corrected, station_id, flags
+    )
+
+    # Do not compare across a clock-reset boundary when assessing gaps.
+    for _, segment in corrected.groupby(
+        "_segment", sort=False
+    ):
+        flag_gaps(
+            segment,
+            station_id,
+            interval_minutes,
+            flags,
+        )
 
 
 def main():
     if len(sys.argv) != 2:
-        print("Usage: python check.py <pack_folder>", file=sys.stderr)
+        print(
+            "Usage: python check.py <pack_folder>",
+            file=sys.stderr,
+        )
         return 2
 
     pack = Path(sys.argv[1])
@@ -436,9 +632,9 @@ def main():
         print(f"Error: pack folder not found: {pack}", file=sys.stderr)
         return 2
 
-    stations_file = pack / "stations.csv"
+    stations_path = pack / "stations.csv"
 
-    if not stations_file.exists():
+    if not stations_path.exists():
         print(
             f"Error: stations.csv not found in {pack}",
             file=sys.stderr,
@@ -446,7 +642,7 @@ def main():
         return 2
 
     try:
-        stations = pd.read_csv(stations_file)
+        stations = pd.read_csv(stations_path)
     except Exception as exc:
         print(f"Error reading stations.csv: {exc}", file=sys.stderr)
         return 2

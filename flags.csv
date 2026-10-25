@@ -1,0 +1,4 @@
+station_id,channel,start_utc,end_utc,issue,action,note
+S06,timestamp_utc,2025-03-24 16:10,2025-04-11 23:50,logger clock offset,correct,Shifted timestamps by 21600.0 seconds; median logger-minus-RMC offset was -21600.0 seconds in clock segment 2.
+S08,all,2025-03-16 14:00,2025-03-18 01:30,missing logger interval(s),exclude,Expected 10-minute sampling; the gap between valid observations is 2150 minutes.
+S08,all,2025-04-05 00:00,2025-04-05 23:50,exact duplicate row(s),correct,drop the repeated copy; 144 repeated row(s).
