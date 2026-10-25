@@ -71,5 +71,28 @@ warmth is real. If the station reads higher, the shield is faulty.
    should be about 10 hPa lower. The old board was right (10.3 lower), but the new
    board is only 3.4 lower, so it reads 6.7 too high. Adding would have made it worse.
 
+## 04 The same checker has to run unattended on 500 stations, and nobody will read every flag.What do you change, what do you drop, and what would you refuse to automate?
 
+Change:
+- Compare each station only with its k nearest neighbours (by distance and
+  altitude), not with the whole network. Stations far apart have different weather.
+- Rank flags by how serious they are, and only alert when a problem is new or
+  getting worse. Don't repeat the same alert every day for a known problem.
+- Set thresholds by testing on data we know is good, and adjust them so false
+  alarms are rare. With 500 stations, even a few false alarms each would mean
+  hundreds of useless flags, and people would stop reading them.
+- Turn the maintenance log into a simple form (station, date, what was done) so
+  the checker can read it, instead of free text.
+- Make the code faster — it already takes about 1 minute for 8 stations.
 
+Drop:
+- The long written note on every flag; use a short issue code and a severity level.
+- One-off rules written just for this pack.
+
+Refuse to automate:
+- Applying corrections to the official climate record without a person approving
+  them. A correction can be wrong — for S02, the teacher thought the old pressure
+  board was wrong, but the data showed it was the new one.
+- Deleting raw data. Always keep the original and store corrections separately, so
+  any mistake can be checked and undone.
+- Choosing where the technician goes. That needs local knowledge and judgement.
