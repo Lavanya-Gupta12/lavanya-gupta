@@ -1075,11 +1075,372 @@ def merge_consecutive_flags(flags, interval_minutes=10):
     return result
 
 
+
+# ---------------------------------------------------------------------
+# Part 3: cross-station consistency checks
+# ---------------------------------------------------------------------
+
+def daily_channel(frame, channel, how="mean"):
+    data = frame.dropna(subset=["_corrected_timestamp"]).copy()
+    if data.empty:
+        return pd.Series(dtype=float)
+    data["_day"] = data["_corrected_timestamp"].dt.floor("D")
+    data["_value"] = pd.to_numeric(data[channel], errors="coerce")
+    grouped = data.groupby("_day")["_value"]
+    if how == "sum":
+        return grouped.sum(min_count=1)
+    if how == "min":
+        return grouped.min()
+    return grouped.mean()
+
+
+def network_at_times(weather_by_station, station_id, channel):
+    series = []
+    for other_id, frame in weather_by_station.items():
+        if other_id == station_id or frame.empty:
+            continue
+        values = frame.dropna(subset=["_corrected_timestamp"]).copy()
+        values[channel] = pd.to_numeric(values[channel], errors="coerce")
+        series.append(values.groupby("_corrected_timestamp")[channel].median().rename(other_id))
+    if not series:
+        return pd.Series(dtype=float)
+    return pd.concat(series, axis=1).median(axis=1, skipna=True)
+
+
+def check_network_pressure_steps(weather_by_station, flags):
+    """Find persistent pressure steps in station anomalies relative to the network."""
+    anomalies = {}
+    for sid, frame in weather_by_station.items():
+        data = frame.dropna(subset=["_corrected_timestamp"]).copy()
+        pressure = pd.to_numeric(data["pressure_hpa"], errors="coerce")
+        if pressure.notna().sum() < 20:
+            continue
+        own_median = pressure.median()
+        anomaly = pressure - own_median
+        anomalies[sid] = anomaly.groupby(data["_corrected_timestamp"]).median()
+
+    if len(anomalies) < 3:
+        return
+
+    panel = pd.concat(anomalies, axis=1).sort_index()
+    for sid in panel.columns:
+        network = panel.drop(columns=[sid]).median(axis=1, skipna=True)
+        residual = (panel[sid] - network).dropna().sort_index()
+        if len(residual) < 20:
+            continue
+
+        changes = residual.diff()
+        candidates = np.flatnonzero(changes.abs().to_numpy() >= 2.0)
+        best = None
+        for idx in candidates:
+            t = residual.index[idx]
+            # The step itself must be between adjacent 10-minute readings.
+            if idx == 0 or t - residual.index[idx - 1] != pd.Timedelta(minutes=10):
+                continue
+            before = residual[(residual.index >= t - pd.Timedelta(hours=24)) & (residual.index < t)]
+            after = residual[(residual.index >= t) & (residual.index < t + pd.Timedelta(hours=24))]
+            if len(before) < 6 or len(after) < 6:
+                continue
+            delta = float(after.median() - before.median())
+            if abs(delta) < 2.0:
+                continue
+            score = abs(delta)
+            if best is None or score > best[0]:
+                best = (score, t, delta)
+
+        if best:
+            _, start, delta = best
+            add_flag(
+                flags, sid, "pressure_hpa", start, residual.index.max(),
+                "network pressure step", "correct",
+                f"add {-delta:+.1f} hPa to pressure readings",
+            )
+
+
+def check_network_wind_scale(weather_by_station, flags):
+    """Detect the strongest daily station/network wind-ratio split."""
+    daily = {
+        sid: daily_channel(frame, "wind_kmh", "mean")
+        for sid, frame in weather_by_station.items()
+    }
+    if len(daily) < 3:
+        return
+    panel = pd.concat(daily, axis=1).sort_index()
+
+    for sid in panel.columns:
+        network = panel.drop(columns=[sid]).median(axis=1, skipna=True)
+        ratio = (panel[sid] / network.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).dropna()
+        if len(ratio) < 10:
+            continue
+
+        # Use log of the daily ratio and pick the split that best separates two levels.
+        logr = np.log(ratio.clip(lower=1e-3))
+        vals = logr.to_numpy(dtype=float)
+        best = None
+        for split in range(5, len(vals) - 4):
+            left, right = vals[:split], vals[split:]
+            cost = ((left - left.mean()) ** 2).sum() + ((right - right.mean()) ** 2).sum()
+            if best is None or cost < best[0]:
+                pooled = np.sqrt(cost / (len(vals) - 2)) * np.sqrt(1 / len(left) + 1 / len(right))
+                t_stat = abs(right.mean() - left.mean()) / (pooled + 1e-9)
+                best = (cost, split, t_stat)
+        if best is None:
+            continue
+        _, split, t_stat = best
+        split_day = pd.Timestamp(ratio.index[split]).floor("D")
+
+        # Ratio of totals on each side (more robust than daily medians).
+        own_daily = panel[sid]
+        left_ratio = own_daily[own_daily.index < split_day].sum() / network[network.index < split_day].sum()
+        right_ratio = own_daily[own_daily.index >= split_day].sum() / network[network.index >= split_day].sum()
+        factor = max(left_ratio, right_ratio) / min(left_ratio, right_ratio)
+        # Honest stations wobble up to ~1.25x between periods; require 1.4x AND a clear split.
+        if factor < 1.4 or t_stat < 4:
+            continue
+
+        # Refine to the 10-minute interval: best two-level split of the log ratio
+        # within +-36 h of the change day.
+        frame = weather_by_station[sid].dropna(subset=["_corrected_timestamp"]).copy()
+        frame = frame.sort_values("_corrected_timestamp").set_index("_corrected_timestamp")
+        network_10m = network_at_times(weather_by_station, sid, "wind_kmh")
+        own_10m = pd.to_numeric(frame["wind_kmh"], errors="coerce")
+        lr10 = np.log((own_10m + 0.5) / (network_10m.reindex(own_10m.index) + 0.5)).dropna()
+        window = lr10[(lr10.index >= split_day - pd.Timedelta(hours=36)) &
+                      (lr10.index < split_day + pd.Timedelta(hours=36))]
+        boundary = split_day
+        smooth = window
+        best_cost = None
+        for k in range(6, len(smooth) - 6):
+            l, r = smooth.iloc[:k], smooth.iloc[k:]
+            cost = ((l - l.mean()) ** 2).sum() + ((r - r.mean()) ** 2).sum()
+            if best_cost is None or cost < best_cost:
+                best_cost, boundary = cost, smooth.index[k]
+
+        end = weather_by_station[sid]["_corrected_timestamp"].max()
+        if right_ratio < left_ratio:
+            multiplier = left_ratio / right_ratio
+            if abs(multiplier - 3.6) <= 0.5:
+                note = (f"wind fell from {left_ratio:.2f}x to {right_ratio:.2f}x the network median: "
+                        "m/s logged as km/h; multiply by 3.6")
+            else:
+                note = (f"wind fell from {left_ratio:.2f}x to {right_ratio:.2f}x the network median; "
+                        f"multiply by {multiplier:.2f}")
+        else:
+            multiplier = right_ratio / left_ratio
+            note = (f"wind rose from {left_ratio:.2f}x to {right_ratio:.2f}x the network median; "
+                    f"divide by {multiplier:.2f}")
+        add_flag(flags, sid, "wind_kmh", boundary, end,
+                 "network wind scale change", "correct", note)
+
+
+def check_blocked_rain_gauges(weather_by_station, flags):
+    """Detect multi-day dry periods during network rain and subsequent release bursts."""
+    daily = {sid: daily_channel(frame, "rain_mm", "sum")
+             for sid, frame in weather_by_station.items()}
+    if len(daily) < 3:
+        return
+    panel = pd.concat(daily, axis=1).sort_index()
+
+    for sid in panel.columns:
+        own = panel[sid]
+        network = panel.drop(columns=[sid]).median(axis=1, skipna=True)
+        blocked = own.fillna(0).eq(0) & network.ge(5.0)
+        dates = list(blocked[blocked].index)
+        if not dates:
+            continue
+
+        runs = []
+        current = [dates[0]]
+        for day in dates[1:]:
+            if day - current[-1] <= pd.Timedelta(days=1):
+                current.append(day)
+            else:
+                runs.append(current)
+                current = [day]
+        runs.append(current)
+
+        frame = weather_by_station[sid].dropna(subset=["_corrected_timestamp"]).copy()
+        frame = frame.sort_values("_corrected_timestamp")
+        frame["rain_mm"] = pd.to_numeric(frame["rain_mm"], errors="coerce")
+        if frame.empty:
+            continue
+
+        for run in runs:
+            first_day = pd.Timestamp(run[0]).floor("D")
+            last_day_exclusive = pd.Timestamp(run[-1]).floor("D") + pd.Timedelta(days=1)
+            last_tip_rows = frame[(frame["_corrected_timestamp"] < first_day) & (frame["rain_mm"] > 0)]
+            if last_tip_rows.empty:
+                continue
+            last_tip = last_tip_rows["_corrected_timestamp"].max()
+
+            burst_candidates = frame[
+                (frame["_corrected_timestamp"] >= last_day_exclusive)
+                & (frame["_corrected_timestamp"] <= last_day_exclusive + pd.Timedelta(days=10))
+                & (frame["rain_mm"] >= 5)
+            ]
+            if burst_candidates.empty:
+                continue
+            burst_start = burst_candidates["_corrected_timestamp"].min()
+            interval = pd.Timedelta(minutes=10)
+            # rain the neighbours caught while this gauge read zero
+            missed = network[(network.index >= last_tip.floor("D")) &
+                             (network.index <= burst_start.floor("D"))].sum()
+            add_flag(flags, sid, "rain_mm", last_tip + interval, burst_start - interval,
+                     "blocked rain gauge", "exclude",
+                     f"0 mm while the network median had about {missed:.0f} mm; "
+                     "funnel blocked, true rain unknown for this period")
+
+            # Released water: consecutive >=1 mm readings starting at the burst while
+            # the other stations are (nearly) dry at the same time.
+            others_10m = network_at_times(weather_by_station, sid, "rain_mm")
+            run = frame[frame["_corrected_timestamp"] >= burst_start].set_index("_corrected_timestamp")["rain_mm"]
+            end_t = burst_start
+            for t, v in run.items():
+                if t - end_t > interval or v < 1:
+                    break
+                end_t = t
+            total = run[(run.index >= burst_start) & (run.index <= end_t)].sum()
+            nb = others_10m[(others_10m.index >= burst_start) & (others_10m.index <= end_t)]
+            if nb.fillna(0).max() < 1:
+                add_flag(flags, sid, "rain_mm", burst_start, end_t,
+                         "stored water released from rain gauge", "exclude",
+                         f"{total:.1f} mm in {len(run[(run.index >= burst_start) & (run.index <= end_t)])} "
+                         "readings while other stations were dry: water held in the blocked funnel "
+                         "draining when the gauge was cleared")
+
+
+def check_radiation_shield_bias(weather_by_station, stations, flags):
+    """Detect daytime temperature bias after elevation-normalizing temperatures."""
+    elevation = {}
+    for _, row in stations.iterrows():
+        value = pd.to_numeric(pd.Series([row.get("elevation_m")]), errors="coerce").iloc[0]
+        elevation[str(row["station_id"])] = float(value) if pd.notna(value) else 0.0
+
+    adjusted_series = {}
+    ghi_series = {}
+    for sid, frame in weather_by_station.items():
+        data = frame.dropna(subset=["_corrected_timestamp"]).copy()
+        temp = pd.to_numeric(data["temp_c"], errors="coerce")
+        data["adjusted_temp"] = temp + 6.5 * elevation.get(sid, 0.0) / 1000.0
+        adjusted_series[sid] = data.groupby("_corrected_timestamp")["adjusted_temp"].median()
+        ghi_series[sid] = data.groupby("_corrected_timestamp")["ghi_wm2"].median()
+
+    if len(adjusted_series) < 3:
+        return
+    panel = pd.concat(adjusted_series, axis=1).sort_index()
+
+    for sid in panel.columns:
+        network = panel.drop(columns=[sid]).median(axis=1, skipna=True)
+        difference = panel[sid] - network
+        ghi = ghi_series[sid].reindex(difference.index)
+        day = difference[ghi > 500].dropna()
+        night = difference[ghi <= 20].dropna()
+        if day.empty or night.empty:
+            continue
+
+        first = difference.dropna().index.min()
+        baseline_end = first + pd.Timedelta(days=14)
+        baseline_day = day[day.index < baseline_end]
+        baseline_night = night[night.index < baseline_end]
+        if baseline_day.empty or baseline_night.empty:
+            continue
+
+        baseline_day_mean = float(baseline_day.mean())
+        baseline_night_mean = float(baseline_night.mean())
+        day_daily = day.groupby(day.index.floor("D")).mean()
+        night_daily = night.groupby(night.index.floor("D")).mean()
+        day_roll = day_daily.rolling(7, min_periods=5).mean()
+        night_roll = night_daily.rolling(7, min_periods=5).mean()
+
+        bias = day_roll - baseline_day_mean
+        night_change = (night_roll - baseline_night_mean).reindex(bias.index)
+        candidates = bias[(bias >= 1.5) & (night_change.abs() <= 1.0) &
+                          (bias.index >= baseline_end.floor("D"))]
+        if candidates.empty:
+            continue
+
+        start_day = candidates.index.min()
+        day_rows = weather_by_station[sid][
+            (weather_by_station[sid]["_corrected_timestamp"] >= start_day)
+            & (weather_by_station[sid]["_corrected_timestamp"] < start_day + pd.Timedelta(days=1))
+        ]
+        start = day_rows["_corrected_timestamp"].min() if not day_rows.empty else start_day
+        end = weather_by_station[sid]["_corrected_timestamp"].max()
+        add_flag(flags, sid, "temp_c", start, end,
+                 "radiation shield temperature bias", "exclude",
+                 f"7-day daytime difference rose {bias.loc[start_day]:.1f} C; "
+                 "night-time difference remained within 1 C of baseline")
+
+
+def check_keep_flags(weather_by_station, stations, flags):
+    """Add KEEP flags for elevation-explained temperature and possible snowmelt."""
+    elevations = {}
+    for _, row in stations.iterrows():
+        value = pd.to_numeric(pd.Series([row.get("elevation_m")]), errors="coerce").iloc[0]
+        elevations[str(row["station_id"])] = float(value) if pd.notna(value) else 0.0
+
+    means = {}
+    adjusted_means = {}
+    for sid, frame in weather_by_station.items():
+        vals = pd.to_numeric(frame["temp_c"], errors="coerce").dropna()
+        if vals.empty:
+            continue
+        means[sid] = float(vals.mean())
+        adjusted_means[sid] = means[sid] + 6.5 * elevations.get(sid, 0.0) / 1000.0
+
+    if len(means) >= 3:
+        network_raw = float(np.median(list(means.values())))
+        network_adjusted = float(np.median(list(adjusted_means.values())))
+        for sid, mean_temp in means.items():
+            raw_diff = mean_temp - network_raw
+            adjusted_diff = adjusted_means[sid] - network_adjusted
+            if abs(raw_diff) >= 4.0 and abs(adjusted_diff) < 2.0:
+                frame = weather_by_station[sid]
+                add_flag(flags, sid, "temp_c",
+                         frame["_corrected_timestamp"].min(),
+                         frame["_corrected_timestamp"].max(),
+                         "temperature difference explained by elevation", "keep",
+                         f"raw network difference {raw_diff:+.1f} C; "
+                         f"elevation-adjusted difference {adjusted_diff:+.1f} C")
+
+    daily_rain = {sid: daily_channel(frame, "rain_mm", "sum")
+                  for sid, frame in weather_by_station.items()}
+    daily_min = {sid: daily_channel(frame, "temp_c", "min")
+                 for sid, frame in weather_by_station.items()}
+    if len(daily_rain) < 3:
+        return
+    rain_panel = pd.concat(daily_rain, axis=1).sort_index()
+    min_panel = pd.concat(daily_min, axis=1).sort_index()
+
+    for sid in rain_panel.columns:
+        others = rain_panel.drop(columns=[sid])
+        exclusive = rain_panel[sid].fillna(0).gt(0) & others.fillna(0).eq(0).all(axis=1)
+        dates = exclusive[exclusive].index
+        if len(dates) < 3:
+            continue
+        minimums = min_panel[sid].reindex(dates)
+        fraction = float((minimums < 0).sum()) / len(dates)
+        if fraction < 0.60:
+            continue
+        add_flag(flags, sid, "rain_mm", pd.Timestamp(dates.min()),
+                 pd.Timestamp(dates.max()) + pd.Timedelta(days=1) - pd.Timedelta(minutes=10),
+                 "snowmelt in gauge", "keep",
+                 f"{len(dates)} station-only rain day(s); {fraction:.0%} had sub-zero daily minimum")
+
+
+def run_part3(weather_by_station, stations, flags):
+    check_network_pressure_steps(weather_by_station, flags)
+    check_network_wind_scale(weather_by_station, flags)
+    check_blocked_rain_gauges(weather_by_station, flags)
+    check_radiation_shield_bias(weather_by_station, stations, flags)
+    check_keep_flags(weather_by_station, stations, flags)
+
+
 # ---------------------------------------------------------------------
 # Station processing and main
 # ---------------------------------------------------------------------
 
-def process_station(pack_folder, station_row):
+def process_station(pack_folder, station_row, return_weather=False):
     station_id = str(station_row["station_id"])
     data_path = pack_folder / "data" / f"{station_id}.csv"
     gps_path = pack_folder / "gps" / f"{station_id}.nmea"
@@ -1091,7 +1452,7 @@ def process_station(pack_folder, station_row):
             "missing weather data file", "exclude",
             f"file not found: {data_path}",
         )
-        return flags
+        return (flags, None) if return_weather else flags
 
     weather = pd.read_csv(data_path)
 
@@ -1105,7 +1466,7 @@ def process_station(pack_folder, station_row):
             "missing required columns", "exclude",
             ", ".join(missing_columns),
         )
-        return flags
+        return (flags, None) if return_weather else flags
 
     weather["timestamp_utc"] = weather["timestamp_utc"].apply(parse_utc)
 
@@ -1159,7 +1520,7 @@ def process_station(pack_folder, station_row):
     )
     check_gps_position(gps, station_row, station_id, flags, weather)
 
-    return flags
+    return (flags, weather) if return_weather else flags
 
 
 def main():
@@ -1180,8 +1541,17 @@ def main():
     stations = pd.read_csv(stations_path, dtype={"station_id": str})
 
     all_flags = []
+    weather_by_station = {}
     for _, station_row in stations.iterrows():
-        all_flags.extend(process_station(pack_folder, station_row))
+        station_flags, corrected_weather = process_station(
+            pack_folder, station_row, return_weather=True
+        )
+        all_flags.extend(station_flags)
+        if corrected_weather is not None and not corrected_weather.empty:
+            weather_by_station[str(station_row["station_id"])] = corrected_weather
+
+    # Part 3 compares stations using their clock-corrected, cleaned records.
+    run_part3(weather_by_station, stations, all_flags)
 
     # IMPORTANT: suppress RH out-of-range flags fully contained within
     # a same-station/channel humidity saturation flag before merging.

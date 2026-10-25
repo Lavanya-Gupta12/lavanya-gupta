@@ -1,11 +1,18 @@
 station_id,channel,start_utc,end_utc,issue,action,note
+S01,rain_mm,2025-03-13 00:00,2025-03-27 23:50,snowmelt in gauge,keep,6 station-only rain day(s); 100% had sub-zero daily minimum
+S01,temp_c,2025-03-01 00:00,2025-04-11 23:50,temperature difference explained by elevation,keep,raw network difference -10.0 C; elevation-adjusted difference -1.3 C
+S02,pressure_hpa,2025-03-21 17:20,2025-04-11 23:50,network pressure step,correct,add -6.7 hPa to pressure readings
 S03,temp_c,2025-03-18 06:00,2025-03-21 14:00,sensor stuck at constant value,exclude,constant value 6.5 for 80.0 h
 S03,temp_c,2025-03-05 14:20,2025-03-05 14:20,temperature sensor error code,exclude,temperature error code: -40 C
 S03,temp_c,2025-03-12 03:40,2025-03-12 03:40,temperature sensor error code,exclude,temperature error code: 85 C
 S03,temp_c,2025-04-02 22:10,2025-04-02 22:10,temperature sensor error code,exclude,temperature error code: -40 C
 S03,temp_c,2025-04-08 09:50,2025-04-08 09:50,temperature sensor error code,exclude,temperature error code: 85 C
+S04,rain_mm,2025-03-23 06:00,2025-04-02 16:00,blocked rain gauge,exclude,"0 mm while the network median had about 33 mm; funnel blocked, true rain unknown for this period"
+S04,rain_mm,2025-04-02 16:10,2025-04-02 16:30,stored water released from rain gauge,exclude,33.4 mm in 3 readings while other stations were dry: water held in the blocked funnel draining when the gauge was cleared
+S04,temp_c,2025-03-26 00:00,2025-04-11 23:50,radiation shield temperature bias,exclude,7-day daytime difference rose 1.6 C; night-time difference remained within 1 C of baseline
 S05,metadata,2025-03-01 00:00,2025-04-11 23:50,GPS position differs from station metadata,correct,"median valid GPS position 39.7540, -104.8957 is 20.5 km from stations.csv (39.5700, -104.8957) and steady all period; fix the metadata, the data itself is fine."
 S05,rh_pct,2025-03-07 12:00,2025-03-11 00:00,humidity sensor stuck at saturation,exclude,"RH remained at or above 98% for at least 6 hours, including values above 100%"
 S06,all,2025-03-24 16:10,2025-04-11 23:50,logger clock offset,correct,GPS time shows the logger clock is 6.00 h behind UTC in this part of the file; shift timestamps by +6.00 h.
+S07,wind_kmh,2025-03-26 15:40,2025-04-11 23:50,network wind scale change,correct,wind fell from 1.02x to 0.28x the network median: m/s logged as km/h; multiply by 3.6
 S08,all,2025-03-16 14:00,2025-03-18 01:30,data gap,exclude,214 expected interval(s) missing
 S08,all,2025-04-05 00:00,2025-04-05 23:50,exact duplicate row,correct,drop the repeated copy; 144 repeated row(s)
