@@ -56,22 +56,20 @@ warmth is real. If the station reads higher, the shield is faulty.
 
 ## 03 Where the AI was wrong: Give one or two moments where an AI tool gave you something plausible butwrong (code, an explanation, a threshold). Quote it briefly and say how you noticed.
 
-1. S06 clock. ChatGPT's first check.py flagged 36 "conflicting duplicate
-   timestamps" and a "370-minute gap" at S06. That was wrong. After the battery
-   swap on 24 March, the logger restarted on local time (UTC-6), so its clock went
-   6 hours behind: the times go 16:00 and then back to 10:10. The hours 10:10-16:00
-   appear twice, but the second set are new real readings with the wrong time, not
-   duplicates. The code checked for duplicates before fixing the clock, so it deleted
-   them and never found the clock error. I noticed because the maintenance log says
-   the logger rebooted on 24 March, S06.csv jumps backwards in time, and the GPS
-   line at logger time 11:00 says the real time is 17:00. The fix was to correct the
-   clock first, then check duplicates.
+1. S06 clock. ChatGPT's first check.py said S06 had 36 duplicate rows and a
+   6-hour gap on 24 March. That was wrong. After the battery swap, the logger
+   restarted with its clock 6 hours behind (local time instead of UTC). So new
+   readings were saved with old times — for example, the 16:10 reading was labelled
+   10:10. The code thought these were duplicates and deleted them. Really, their
+   time labels just needed +6 hours. I noticed because the time in S06.csv jumps
+   backwards (16:00, then 10:10), the maintenance log says the logger rebooted that
+   day, and the GPS line written at logger time 11:00 says the real time was 17:00.
+   The fix: correct the clock first, then look for duplicates.
 
-2. S02 pressure sign. In the report, ChatGPT wrote "add 6.7 hPa" for S02. It
-   dropped the minus sign from "add -6.7" in flags.csv. The correct fix is to
-   subtract 6.7. I checked with elevation: S02 is 100 m above S03, so it should read
-   about 10 hPa lower. The old board was 10.3 lower (correct); the new board is only
-   3.4 lower, so it reads 6.7 too high. Adding 6.7 would have doubled the error.
+2. S02 pressure. In the report, ChatGPT said to add 6.7 hPa to S02's pressure.
+   The correct fix is to subtract 6.7. S02 is 100 m higher than S03, so its pressure
+   should be about 10 hPa lower. The old board was right (10.3 lower), but the new
+   board is only 3.4 lower, so it reads 6.7 too high. Adding would have made it worse.
 
-   
+
 
