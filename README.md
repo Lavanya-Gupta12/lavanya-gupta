@@ -2,7 +2,7 @@ Lavanya Gupta
 
 lavanya.gupta.btech2023@sitpune.edu.in
 
-Video: <link to add>
+Video: https://youtu.be/MRyOePxe5oc
 
 Run: `python check.py <pack_folder>`
 
