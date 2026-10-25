@@ -1,8 +1,16 @@
+#!/usr/bin/env python3
+"""Weather-station data quality checks.
+
+Usage:
+    python check.py <pack_folder>
+
+Writes flags.csv to the current working directory.
+"""
 
 import sys
-import re
 import math
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
@@ -18,180 +26,226 @@ OUTPUT_COLUMNS = [
     "note",
 ]
 
-EARTH_RADIUS_M = 6_371_000.0
-STUCK_DURATION = pd.Timedelta(hours=6)
+WEATHER_COLUMNS = [
+    "timestamp_utc",
+    "temp_c",
+    "rh_pct",
+    "pressure_hpa",
+    "wind_kmh",
+    "wind_dir_deg",
+    "rain_mm",
+    "ghi_wm2",
+]
+
+SATURATION_ISSUE = "humidity sensor stuck at saturation"
+RH_RANGE_ISSUE = "relative humidity outside 0..100%"
 
 
-def parse_nmea_checksum(sentence):
-    sentence = sentence.strip()
+# ---------------------------------------------------------------------
+# General helpers
+# ---------------------------------------------------------------------
 
-    if not sentence.startswith("$") or "*" not in sentence:
-        return False
-
-    body, checksum = sentence[1:].rsplit("*", 1)
-
-    if not re.fullmatch(r"[0-9A-Fa-f]{2}", checksum):
-        return False
-
-    value = 0
-    for char in body:
-        value ^= ord(char)
-
-    return value == int(checksum, 16)
-
-
-def parse_nmea_time(value):
-    match = re.fullmatch(
-        r"(\d{2})(\d{2})(\d{2}(?:\.\d+)?)",
-        value.strip(),
-    )
-
-    if not match:
-        return None
-
-    hour = int(match.group(1))
-    minute = int(match.group(2))
-    seconds = float(match.group(3))
-
-    if hour > 23 or minute > 59 or seconds >= 60:
-        return None
-
-    return hour * 3600 + minute * 60 + seconds
-
-
-def parse_nmea_date(value):
-    if not re.fullmatch(r"\d{6}", value.strip()):
-        return None
-
-    day = int(value[:2])
-    month = int(value[2:4])
-    year = int(value[4:6])
-    year += 2000 if year < 80 else 1900
-
-    try:
-        return pd.Timestamp(
-            year=year, month=month, day=day, tz="UTC"
-        )
-    except ValueError:
-        return None
-
-
-def parse_coordinate(value, hemisphere, is_latitude):
-    try:
-        number = float(value)
-    except (ValueError, TypeError):
-        return None
-
-    degrees = int(number // 100)
-    minutes = number - degrees * 100
-
-    if not 0 <= minutes < 60:
-        return None
-
-    result = degrees + minutes / 60.0
-    hemisphere = hemisphere.strip().upper()
-
-    if is_latitude:
-        if hemisphere not in ("N", "S") or result > 90:
-            return None
-        if hemisphere == "S":
-            result = -result
-    else:
-        if hemisphere not in ("E", "W") or result > 180:
-            return None
-        if hemisphere == "W":
-            result = -result
-
+def parse_utc(value):
+    """Parse a timestamp as UTC, returning NaT if invalid."""
+    result = pd.to_datetime(value, errors="coerce", utc=True)
     return result
 
 
-def format_utc(value):
+def timestamp_text(value):
+    """Format timestamps consistently in UTC."""
     if value is None or pd.isna(value):
         return ""
-
-    timestamp = pd.Timestamp(value)
-
-    if timestamp.tzinfo is None:
-        timestamp = timestamp.tz_localize("UTC")
+    value = pd.Timestamp(value)
+    if value.tzinfo is None:
+        value = value.tz_localize("UTC")
     else:
-        timestamp = timestamp.tz_convert("UTC")
+        value = value.tz_convert("UTC")
+    return value.strftime("%Y-%m-%d %H:%M")
 
-    return timestamp.strftime("%Y-%m-%d %H:%M")
 
-
-def add_flag(
-    flags, station_id, channel, start, end, issue, action, note
-):
+def add_flag(flags, station_id, channel, start, end, issue, action, note):
+    """Append one flag. start/end may be None for metadata-only flags."""
     flags.append({
         "station_id": str(station_id),
         "channel": channel,
-        "start_utc": format_utc(start),
-        "end_utc": format_utc(end),
+        "start_utc": start,
+        "end_utc": end,
         "issue": issue,
         "action": action,
         "note": note,
     })
 
 
+def haversine_m(lat1, lon1, lat2, lon2):
+    """Great-circle distance between two points, in metres."""
+    radius = 6_371_000.0
+    p1 = math.radians(float(lat1))
+    p2 = math.radians(float(lat2))
+    dp = math.radians(float(lat2) - float(lat1))
+    dl = math.radians(float(lon2) - float(lon1))
+
+    a = (
+        math.sin(dp / 2) ** 2
+        + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    )
+    return 2 * radius * math.asin(min(1.0, math.sqrt(a)))
+
+
+# ---------------------------------------------------------------------
+# NMEA GPS parsing
+# ---------------------------------------------------------------------
+
+def parse_nmea_checksum(sentence):
+    """Return True only if an NMEA sentence has a valid checksum."""
+    sentence = sentence.strip()
+    if not sentence.startswith("$") or "*" not in sentence:
+        return False
+
+    body, checksum_text = sentence[1:].rsplit("*", 1)
+    try:
+        expected = int(checksum_text[:2], 16)
+    except (ValueError, TypeError):
+        return False
+
+    actual = 0
+    for char in body:
+        actual ^= ord(char)
+    return actual == expected
+
+
+def parse_nmea_time(value):
+    """Parse the hhmmss[.fraction] time field from an NMEA sentence."""
+    if not value or len(value) < 6:
+        return None
+
+    try:
+        hour = int(value[0:2])
+        minute = int(value[2:4])
+        second_float = float(value[4:])
+        second = int(second_float)
+        microsecond = int(round((second_float - second) * 1_000_000))
+        return (hour, minute, second, microsecond)
+    except (ValueError, TypeError):
+        return None
+
+
+def parse_nmea_date(value):
+    """Parse an NMEA RMC date field, formatted ddmmyy."""
+    if not value or len(value) != 6:
+        return None
+
+    try:
+        day = int(value[0:2])
+        month = int(value[2:4])
+        year = int(value[4:6])
+        year += 2000 if year < 80 else 1900
+        return year, month, day
+    except (ValueError, TypeError):
+        return None
+
+
+def parse_coordinate(value, hemisphere):
+    """Convert an NMEA latitude or longitude to signed decimal degrees."""
+    if not value or not hemisphere:
+        return np.nan
+
+    try:
+        raw = float(value)
+        degrees = int(raw // 100)
+        minutes = raw - degrees * 100
+        result = degrees + minutes / 60.0
+
+        if hemisphere.upper() in ("S", "W"):
+            result = -result
+        elif hemisphere.upper() not in ("N", "E"):
+            return np.nan
+
+        return result
+    except (ValueError, TypeError):
+        return np.nan
+
+
+def parse_rmc_datetime(fields):
+    """Return the UTC datetime from a validly formatted RMC fields list."""
+    if len(fields) <= 9:
+        return None
+
+    time_parts = parse_nmea_time(fields[1])
+    date_parts = parse_nmea_date(fields[9])
+
+    if time_parts is None or date_parts is None:
+        return None
+
+    try:
+        year, month, day = date_parts
+        hour, minute, second, microsecond = time_parts
+        return datetime(
+            year, month, day, hour, minute, second, microsecond,
+            tzinfo=timezone.utc,
+        )
+    except ValueError:
+        return None
+
+
 def load_gps(path):
-    columns = [
-        "gps_row", "logger_time", "sentence_type",
-        "gps_time", "lat", "lon",
-    ]
+    """Load checksum-valid GPS records from a station's NMEA file.
+
+    Each line is expected to contain:
+        logger_timestamp,$GPRMC...
+    or:
+        logger_timestamp,$GPGGA...
+
+    Only RMC records with status A are used for clock correction.
+    Valid GGA fixes can be used for station-position checks.
+    """
     records = []
 
     if not path.exists():
-        return pd.DataFrame(columns=columns)
+        return pd.DataFrame(columns=[
+            "logger_timestamp", "gps_time", "lat", "lon", "line_number"
+        ])
 
-    with path.open(
-        "r", encoding="utf-8-sig", errors="replace"
-    ) as file:
-        for gps_row, line in enumerate(file):
+    with path.open("r", encoding="utf-8", errors="replace") as file:
+        for line_number, line in enumerate(file):
             line = line.strip()
-
             if not line:
                 continue
 
-            parts = line.split(",", 1)
-            if len(parts) != 2:
+            if "," not in line:
                 continue
 
-            logger_time = pd.to_datetime(
-                parts[0].strip(), errors="coerce", utc=True
-            )
-            sentence = parts[1].strip()
+            logger_text, sentence = line.split(",", 1)
+            logger_timestamp = parse_utc(logger_text.strip())
 
-            if pd.isna(logger_time):
+            if pd.isna(logger_timestamp):
                 continue
 
+            sentence = sentence.strip()
             if not parse_nmea_checksum(sentence):
                 continue
 
-            fields = sentence[
-                1:sentence.rfind("*")
-            ].split(",")
-
-            sentence_type = fields[0] if fields else ""
+            fields = sentence.split(",")
+            sentence_type = fields[0][-3:]
             gps_time = pd.NaT
-            lat = None
-            lon = None
+            lat = np.nan
+            lon = np.nan
 
-            if sentence_type == "GPRMC":
-                if len(fields) < 10 or fields[2].strip() != "A":
+            if sentence_type == "RMC":
+                # RMC status must be A (active/valid).
+                if len(fields) <= 9 or fields[2].upper() != "A":
                     continue
 
-                seconds = parse_nmea_time(fields[1])
-                date = parse_nmea_date(fields[9])
-
-                if seconds is None or date is None:
+                parsed_time = parse_rmc_datetime(fields)
+                if parsed_time is None:
                     continue
 
-                gps_time = date + pd.to_timedelta(seconds, unit="s")
-                lat = parse_coordinate(fields[3], fields[4], True)
-                lon = parse_coordinate(fields[5], fields[6], False)
+                gps_time = pd.Timestamp(parsed_time)
+                lat = parse_coordinate(fields[3], fields[4])
+                lon = parse_coordinate(fields[5], fields[6])
 
-            elif sentence_type == "GPGGA":
-                if len(fields) < 10:
+            elif sentence_type == "GGA":
+                # GGA fix quality must be greater than zero.
+                if len(fields) <= 6:
                     continue
 
                 try:
@@ -202,952 +256,958 @@ def load_gps(path):
                 if fix_quality <= 0:
                     continue
 
-                lat = parse_coordinate(fields[2], fields[3], True)
-                lon = parse_coordinate(fields[4], fields[5], False)
+                lat = parse_coordinate(fields[2], fields[3])
+                lon = parse_coordinate(fields[4], fields[5])
 
             else:
                 continue
 
             records.append({
-                "gps_row": gps_row,
-                "logger_time": logger_time,
-                "sentence_type": sentence_type,
+                "logger_timestamp": logger_timestamp,
                 "gps_time": gps_time,
                 "lat": lat,
                 "lon": lon,
+                "line_number": line_number,
             })
 
-    return pd.DataFrame(records, columns=columns)
+    gps = pd.DataFrame(records)
+    if gps.empty:
+        return pd.DataFrame(columns=[
+            "logger_timestamp", "gps_time", "lat", "lon", "line_number"
+        ])
+
+    return gps.sort_values("line_number").reset_index(drop=True)
 
 
-def split_segments(df, timestamp_column, order_column):
-    segments = []
-    current = []
+# ---------------------------------------------------------------------
+# Clock-jump detection and correction
+# ---------------------------------------------------------------------
+
+def split_segments(df):
+    """Split rows whenever the original logger timestamp moves backwards."""
+    if df.empty:
+        return []
+
+    timestamps = df["timestamp_utc"]
+    segment_ids = []
+    segment_id = 0
     previous = None
 
-    ordered = df.sort_values(order_column, kind="stable")
-
-    for index, row in ordered.iterrows():
-        timestamp = row[timestamp_column]
-
+    for timestamp in timestamps:
         if pd.isna(timestamp):
-            if current:
-                segments.append(current)
-                current = []
-            previous = None
+            segment_ids.append(segment_id)
             continue
 
         if previous is not None and timestamp < previous:
-            segments.append(current)
-            current = []
+            segment_id += 1
 
-        current.append(index)
+        segment_ids.append(segment_id)
         previous = timestamp
 
-    if current:
-        segments.append(current)
+    result = df.copy()
+    result["_segment"] = segment_ids
 
-    return segments
+    return [
+        result[result["_segment"] == segment].copy()
+        for segment in sorted(result["_segment"].unique())
+    ]
 
 
-def estimate_segment_offset(weather, gps, tolerance_seconds):
-    if weather.empty or gps.empty:
-        return None
-
-    gps = gps.loc[
-        gps["sentence_type"].eq("GPRMC")
-        & gps["gps_time"].notna()
-    ].copy()
-
+def split_gps_segments(gps):
+    """Split GPS records at backwards jumps in their logger timestamps."""
     if gps.empty:
-        return None
+        return []
 
-    left = weather[
-        ["_file_row", "timestamp_utc"]
-    ].sort_values("timestamp_utc")
+    result = gps.copy()
+    result["_gps_segment"] = (
+        result["logger_timestamp"].diff().lt(pd.Timedelta(0)).cumsum()
+    )
 
-    right = gps[
-        ["logger_time", "gps_time"]
-    ].sort_values("logger_time")
+    return [
+        result[result["_gps_segment"] == segment].copy()
+        for segment in sorted(result["_gps_segment"].unique())
+    ]
+
+
+def estimate_segment_offset(weather_segment, gps_segment, interval_minutes):
+    """Estimate logger_timestamp minus GPS time for one segment."""
+    if weather_segment.empty or gps_segment.empty:
+        return pd.Timedelta(0)
+
+    valid_gps = gps_segment.dropna(subset=["gps_time", "logger_timestamp"])
+    if valid_gps.empty:
+        return pd.Timedelta(0)
+
+    weather_times = weather_segment[["timestamp_utc"]].dropna().copy()
+    if weather_times.empty:
+        return pd.Timedelta(0)
+
+    weather_times = weather_times.sort_values("timestamp_utc")
+    gps_times = valid_gps[
+        ["logger_timestamp", "gps_time"]
+    ].sort_values("logger_timestamp")
+
+    tolerance = pd.Timedelta(
+        seconds=max(120, interval_minutes * 30)
+    )
 
     matched = pd.merge_asof(
-        left,
-        right,
+        weather_times,
+        gps_times,
         left_on="timestamp_utc",
-        right_on="logger_time",
+        right_on="logger_timestamp",
         direction="nearest",
-        tolerance=pd.Timedelta(seconds=tolerance_seconds),
-    ).dropna(subset=["gps_time"])
+        tolerance=tolerance,
+    )
 
+    matched = matched.dropna(subset=["gps_time", "logger_timestamp"])
     if matched.empty:
-        return None
+        return pd.Timedelta(0)
 
     offsets = (
-        matched["timestamp_utc"] - matched["gps_time"]
-    ).dt.total_seconds().dropna()
+        matched["logger_timestamp"] - matched["gps_time"]
+    ).dropna()
 
-    return float(np.median(offsets)) if len(offsets) else None
+    if offsets.empty:
+        return pd.Timedelta(0)
+
+    return offsets.median()
 
 
-def haversine_m(lat1, lon1, lat2, lon2):
-    lat1, lon1, lat2, lon2 = map(
-        math.radians, [lat1, lon1, lat2, lon2]
+def correct_clock(weather, gps, station_id, interval_minutes, flags):
+    """Correct weather timestamps using GPS offsets, segment by segment."""
+    weather = weather.copy()
+    weather["_file_row"] = np.arange(len(weather))
+    weather["_corrected_timestamp"] = weather["timestamp_utc"]
+
+    weather_segments = split_segments(weather)
+    gps_segments = split_gps_segments(gps)
+
+    # Match segments by their sequence/order in the files. If the GPS file
+    # contains fewer segments, use the closest available segment in order.
+    for segment_index, weather_segment in enumerate(weather_segments):
+        if not gps_segments:
+            break
+
+        gps_index = min(segment_index, len(gps_segments) - 1)
+        gps_segment = gps_segments[gps_index]
+
+        offset = estimate_segment_offset(
+            weather_segment, gps_segment, interval_minutes
+        )
+
+        # Only correct real clock errors (>= 2 min). GPS-vs-logger
+        # differences of a second or two are normal and must not shift data.
+        if abs(offset.total_seconds()) < 120:
+            continue
+        # Round to whole minutes: GPS sentences carry a second or two of noise.
+        offset = pd.Timedelta(minutes=round(offset.total_seconds() / 60))
+
+        shift = -offset
+        row_indices = weather_segment.index
+        weather.loc[row_indices, "_corrected_timestamp"] = (
+            weather.loc[row_indices, "timestamp_utc"] + shift
+        )
+
+        corrected = weather.loc[row_indices, "_corrected_timestamp"]
+        add_flag(
+            flags,
+            station_id,
+            "all",
+            corrected.min(),
+            corrected.max(),
+            "logger clock offset",
+            "correct",
+            f"GPS time shows the logger clock is {abs(offset.total_seconds()) / 3600:.2f} h "
+            f"{'ahead of' if offset.total_seconds() > 0 else 'behind'} UTC in this part of the file; "
+            f"shift timestamps by {shift.total_seconds() / 3600:+.2f} h.",
+        )
+
+    return weather
+
+
+# ---------------------------------------------------------------------
+# Part 1: duplicates, conflicts, and gaps
+# ---------------------------------------------------------------------
+
+def handle_duplicates_and_conflicts(weather, station_id, flags):
+    """Flag exact duplicate copies and exclude conflicting timestamps."""
+    weather = weather.copy()
+
+    raw_value_columns = [
+        column for column in WEATHER_COLUMNS if column in weather.columns
+    ]
+
+    # Exact duplicates mean identical original timestamp and sensor values.
+    duplicate_mask = weather.duplicated(
+        subset=raw_value_columns, keep="first"
     )
 
-    dlat = lat2 - lat1
-    dlon = lon2 - lon1
+    duplicate_rows = weather[duplicate_mask].copy()
+    if not duplicate_rows.empty:
+        for _, row in duplicate_rows.iterrows():
+            timestamp = row["_corrected_timestamp"]
+            add_flag(
+                flags,
+                station_id,
+                "all",
+                timestamp,
+                timestamp,
+                "exact duplicate row",
+                "correct",
+                "drop the repeated copy",
+            )
 
-    a = (
-        math.sin(dlat / 2) ** 2
-        + math.cos(lat1) * math.cos(lat2)
-        * math.sin(dlon / 2) ** 2
+    weather = weather.loc[~duplicate_mask].copy()
+
+    # Conflicting rows share a corrected timestamp but have different values.
+    conflicting_timestamps = weather.groupby(
+        "_corrected_timestamp", dropna=True
+    )[raw_value_columns].apply(
+        lambda group: len(group.drop_duplicates()) > 1
     )
 
-    return 2 * EARTH_RADIUS_M * math.asin(
-        min(1.0, math.sqrt(a))
-    )
+    conflict_times = conflicting_timestamps[
+        conflicting_timestamps
+    ].index
 
+    if len(conflict_times):
+        for timestamp in conflict_times:
+            add_flag(
+                flags,
+                station_id,
+                "all",
+                timestamp,
+                timestamp,
+                "conflicting values at same timestamp",
+                "exclude",
+                "multiple different rows share this timestamp",
+            )
+
+        weather = weather[
+            ~weather["_corrected_timestamp"].isin(conflict_times)
+        ].copy()
+
+    return weather
+
+
+def check_gaps(weather, station_id, interval_minutes, flags):
+    """Flag gaps larger than the configured logger interval."""
+    if weather.empty:
+        return
+
+    expected = pd.Timedelta(minutes=interval_minutes)
+    ordered = weather.dropna(
+        subset=["_corrected_timestamp"]
+    ).sort_values("_corrected_timestamp")
+
+    if len(ordered) < 2:
+        return
+
+    timestamps = ordered["_corrected_timestamp"].reset_index(drop=True)
+
+    for i in range(1, len(timestamps)):
+        previous = timestamps.iloc[i - 1]
+        current = timestamps.iloc[i]
+        difference = current - previous
+
+        if difference > expected * 1.5:
+            missing_intervals = max(
+                0, int(round(difference / expected)) - 1
+            )
+            add_flag(
+                flags,
+                station_id,
+                "all",
+                previous + expected,
+                current - expected,
+                "data gap",
+                "exclude",
+                f"{missing_intervals} expected interval(s) missing",
+            )
+
+
+# ---------------------------------------------------------------------
+# Part 2: impossible values
+# ---------------------------------------------------------------------
+
+def check_impossible_values(weather, station_id, flags):
+    """Flag impossible sensor values, including temperature error codes."""
+    checks = [
+        ("temp_c", lambda s: (s < -45) | (s > 50),
+         "temperature outside -45..50 C"),
+        ("rh_pct", lambda s: (s < 0) | (s > 100),
+         RH_RANGE_ISSUE),
+        ("rain_mm", lambda s: s < 0, "negative rainfall"),
+        ("wind_kmh", lambda s: s < 0, "negative wind speed"),
+        ("ghi_wm2", lambda s: s < 0, "negative solar irradiance"),
+    ]
+
+    # Standard temperature sensor error codes get their own issue.
+    temperature_codes = weather["temp_c"].isin([-40, 85])
+    for _, row in weather[temperature_codes].iterrows():
+        timestamp = row["_corrected_timestamp"]
+        add_flag(
+            flags,
+            station_id,
+            "temp_c",
+            timestamp,
+            timestamp,
+            "temperature sensor error code",
+            "exclude",
+            f"temperature error code: {row['temp_c']:g} C",
+        )
+
+    for channel, predicate, issue in checks:
+        values = weather[channel]
+        mask = predicate(values)
+
+        if channel == "temp_c":
+            mask = mask & ~temperature_codes
+
+        for _, row in weather[mask.fillna(False)].iterrows():
+            timestamp = row["_corrected_timestamp"]
+            value = row[channel]
+            add_flag(
+                flags,
+                station_id,
+                channel,
+                timestamp,
+                timestamp,
+                issue,
+                "exclude",
+                f"observed value: {value}",
+            )
+
+
+# ---------------------------------------------------------------------
+# Temperature spikes
+# ---------------------------------------------------------------------
+
+def check_temperature_spikes(weather, station_id, flags):
+    """Flag temperatures more than 10 C from a nearby-reading median."""
+    ordered = weather.sort_values("_corrected_timestamp").reset_index(
+        drop=True
+    )
+    values = pd.to_numeric(ordered["temp_c"], errors="coerce")
+
+    for i, value in enumerate(values):
+        if pd.isna(value) or value in (-40, 85):
+            continue
+
+        start = max(0, i - 3)
+        end = min(len(values), i + 4)
+        neighbours = values.iloc[start:end].copy()
+
+        # Exclude the current row and known temperature error codes.
+        neighbours = neighbours.drop(index=i, errors="ignore")
+        neighbours = neighbours[
+            ~neighbours.isin([-40, 85])
+        ].dropna()
+
+        if len(neighbours) < 3:
+            continue
+
+        median = neighbours.median()
+        if abs(value - median) > 10:
+            timestamp = ordered.loc[i, "_corrected_timestamp"]
+            add_flag(
+                flags,
+                station_id,
+                "temp_c",
+                timestamp,
+                timestamp,
+                "temperature spike",
+                "exclude",
+                f"{value:g} C differs from nearby median {median:g} C",
+            )
+
+
+# ---------------------------------------------------------------------
+# Stuck sensors and humidity saturation
+# ---------------------------------------------------------------------
+
+def check_stuck_sensors(weather, station_id, interval_minutes, flags):
+    """Detect long exact-value runs and high humidity saturation runs."""
+    ordered = weather.sort_values("_corrected_timestamp").reset_index(
+        drop=True
+    )
+    minimum_duration = pd.Timedelta(hours=6)
+    interval = pd.Timedelta(minutes=interval_minutes)
+
+    # Special humidity saturation rule:
+    # RH >= 98% for at least 6 hours, with at least one value > 100%.
+    rh = pd.to_numeric(ordered["rh_pct"], errors="coerce")
+    run_start = None
+    run_values = []
+
+    def finish_humidity_run(run_end_index):
+        nonlocal run_start, run_values
+
+        if run_start is None or not run_values:
+            run_start = None
+            run_values = []
+            return
+
+        start_time = ordered.loc[run_start, "_corrected_timestamp"]
+        end_time = ordered.loc[run_end_index, "_corrected_timestamp"]
+        run_series = pd.Series(run_values)
+
+        if (
+            end_time - start_time >= minimum_duration
+            and (run_series > 100).any()
+        ):
+            add_flag(
+                flags,
+                station_id,
+                "rh_pct",
+                start_time,
+                end_time,
+                SATURATION_ISSUE,
+                "exclude",
+                "RH remained at or above 98% for at least 6 hours, "
+                "including values above 100%",
+            )
+
+        run_start = None
+        run_values = []
+
+    for i, value in enumerate(rh):
+        timestamp = ordered.loc[i, "_corrected_timestamp"]
+        eligible = pd.notna(value) and value >= 98
+
+        if not eligible:
+            if run_start is not None:
+                finish_humidity_run(i - 1)
+            continue
+
+        if run_start is None:
+            run_start = i
+            run_values = [value]
+            continue
+
+        previous_time = ordered.loc[i - 1, "_corrected_timestamp"]
+        if pd.isna(timestamp) or pd.isna(previous_time):
+            finish_humidity_run(i - 1)
+            run_start = i
+            run_values = [value]
+        elif timestamp - previous_time > interval * 1.5:
+            finish_humidity_run(i - 1)
+            run_start = i
+            run_values = [value]
+        else:
+            run_values.append(value)
+
+    if run_start is not None:
+        finish_humidity_run(len(ordered) - 1)
+
+    # Exact repeated-value runs in the listed channels.
+    for channel in (
+        "temp_c",
+        "rh_pct",
+        "pressure_hpa",
+        "wind_dir_deg",
+    ):
+        values = pd.to_numeric(ordered[channel], errors="coerce")
+        run_start = 0
+
+        while run_start < len(ordered):
+            value = values.iloc[run_start]
+            if pd.isna(value):
+                run_start += 1
+                continue
+
+            run_end = run_start
+            while run_end + 1 < len(ordered):
+                next_value = values.iloc[run_end + 1]
+                if pd.isna(next_value) or next_value != value:
+                    break
+
+                time_now = ordered.loc[run_end, "_corrected_timestamp"]
+                time_next = ordered.loc[run_end + 1, "_corrected_timestamp"]
+
+                if (
+                    pd.isna(time_now)
+                    or pd.isna(time_next)
+                    or time_next - time_now > interval * 1.5
+                ):
+                    break
+
+                run_end += 1
+
+            start_time = ordered.loc[run_start, "_corrected_timestamp"]
+            end_time = ordered.loc[run_end, "_corrected_timestamp"]
+
+            # The humidity saturation rule above handles this case as one
+            # whole-run flag. Do not create a second generic stuck flag
+            # for values inside a qualifying saturation run.
+            is_saturation_run = (
+                channel == "rh_pct"
+                and value >= 98
+                and end_time - start_time >= minimum_duration
+            )
+
+            if (
+                run_end > run_start
+                and end_time - start_time >= minimum_duration
+                and not is_saturation_run
+            ):
+                add_flag(
+                    flags,
+                    station_id,
+                    channel,
+                    start_time,
+                    end_time,
+                    "sensor stuck at constant value",
+                    "exclude",
+                    f"constant value {value:g} for "
+                    f"{(end_time - start_time).total_seconds() / 3600:.1f} h",
+                )
+
+            run_start = run_end + 1
+
+
+# ---------------------------------------------------------------------
+# Solar elevation and nighttime sunlight
+# ---------------------------------------------------------------------
 
 def solar_elevation_deg(timestamp, latitude, longitude):
-    """Approximate solar elevation in degrees."""
+    """Approximate solar elevation for a UTC timestamp and coordinates."""
     timestamp = pd.Timestamp(timestamp)
-
     if timestamp.tzinfo is None:
         timestamp = timestamp.tz_localize("UTC")
     else:
         timestamp = timestamp.tz_convert("UTC")
 
-    day = timestamp.dayofyear
+    day_of_year = timestamp.dayofyear
     hour = (
         timestamp.hour
-        + timestamp.minute / 60
-        + timestamp.second / 3600
-        + timestamp.microsecond / 3.6e9
+        + timestamp.minute / 60.0
+        + timestamp.second / 3600.0
     )
 
-    gamma = 2 * math.pi / 365 * (
-        day - 1 + (hour - 12) / 24
-    )
+    fractional_year = (
+        2 * math.pi / 365
+    ) * (day_of_year - 1 + (hour - 12) / 24)
 
-    equation_of_time = 229.18 * (
+    equation_time = 229.18 * (
         0.000075
-        + 0.001868 * math.cos(gamma)
-        - 0.032077 * math.sin(gamma)
-        - 0.014615 * math.cos(2 * gamma)
-        - 0.040849 * math.sin(2 * gamma)
+        + 0.001868 * math.cos(fractional_year)
+        - 0.032077 * math.sin(fractional_year)
+        - 0.014615 * math.cos(2 * fractional_year)
+        - 0.040849 * math.sin(2 * fractional_year)
     )
 
     declination = (
         0.006918
-        - 0.399912 * math.cos(gamma)
-        + 0.070257 * math.sin(gamma)
-        - 0.006758 * math.cos(2 * gamma)
-        + 0.000907 * math.sin(2 * gamma)
-        - 0.002697 * math.cos(3 * gamma)
-        + 0.00148 * math.sin(3 * gamma)
+        - 0.399912 * math.cos(fractional_year)
+        + 0.070257 * math.sin(fractional_year)
+        - 0.006758 * math.cos(2 * fractional_year)
+        + 0.000907 * math.sin(2 * fractional_year)
+        - 0.002697 * math.cos(3 * fractional_year)
+        + 0.00148 * math.sin(3 * fractional_year)
     )
 
-    solar_minutes = (
-        hour * 60 + equation_of_time + 4 * longitude
-    )
+    true_solar_minutes = (
+        hour * 60 + equation_time + 4 * longitude
+    ) % 1440
 
-    hour_angle = math.radians(solar_minutes / 4 - 180)
+    hour_angle = math.radians(true_solar_minutes / 4 - 180)
     lat_rad = math.radians(latitude)
 
-    sin_elevation = (
+    cosine_zenith = (
         math.sin(lat_rad) * math.sin(declination)
         + math.cos(lat_rad) * math.cos(declination)
         * math.cos(hour_angle)
     )
+    cosine_zenith = max(-1.0, min(1.0, cosine_zenith))
 
-    return math.degrees(
-        math.asin(max(-1.0, min(1.0, sin_elevation)))
-    )
-
-
-def check_impossible_values(df, station_id, flags):
-    checks = {
-        "temp_c": lambda s: (s < -45) | (s > 50),
-        "rh_pct": lambda s: (s < 0) | (s > 100),
-        "rain_mm": lambda s: s < 0,
-        "wind_kmh": lambda s: s < 0,
-        "ghi_wm2": lambda s: s < 0,
-    }
-
-    for channel, predicate in checks.items():
-        if channel not in df.columns:
-            continue
-
-        values = pd.to_numeric(df[channel], errors="coerce")
-        invalid = predicate(values).fillna(False)
-
-        if channel == "temp_c":
-            sensor_codes = values.isin([-40, 85])
-
-            for index in df.index[sensor_codes.fillna(False)]:
-                timestamp = df.at[index, "_corrected_timestamp"]
-                add_flag(
-                    flags, station_id, channel,
-                    timestamp, timestamp,
-                    "temperature sensor error code", "exclude",
-                    f"Temperature is {values.at[index]:g} C, "
-                    "a standard sensor error code (-40 or 85).",
-                )
-
-            invalid = invalid & ~sensor_codes
-
-        for index in df.index[invalid]:
-            timestamp = df.at[index, "_corrected_timestamp"]
-            value = values.at[index]
-
-            reason = {
-                "temp_c": "temperature outside -45..50 C",
-                "rh_pct": "relative humidity outside 0..100%",
-            }.get(channel, f"negative {channel} reading")
-
-            add_flag(
-                flags, station_id, channel,
-                timestamp, timestamp,
-                reason, "exclude",
-                f"Observed value: {value:g}.",
-            )
-
-
-def check_temperature_spikes(df, station_id, flags):
-    if "temp_c" not in df.columns or df.empty:
-        return
-
-    values = pd.to_numeric(df["temp_c"], errors="coerce")
-
-    # Sensor error codes have their own flags, not spike flags.
-    error_codes = values.isin([-40, 85]).fillna(False)
-
-    for position, index in enumerate(df.index):
-        if error_codes.loc[index]:
-            continue
-
-        if pd.isna(values.loc[index]):
-            continue
-
-        start = max(0, position - 3)
-        end = min(len(df), position + 4)
-
-        neighbours = values.iloc[start:end].dropna()
-        neighbours = neighbours.drop(
-            index=df.index[position], errors="ignore"
-        )
-
-        # Remove error codes from the reference median as well.
-        neighbours = neighbours[~neighbours.isin([-40, 85])]
-
-        if len(neighbours) < 3:
-            continue
-
-        median = float(neighbours.median())
-
-        if abs(float(values.loc[index]) - median) > 10:
-            timestamp = df.at[index, "_corrected_timestamp"]
-
-            add_flag(
-                flags, station_id, "temp_c",
-                timestamp, timestamp,
-                "temperature spike", "exclude",
-                f"Temperature {values.loc[index]:g} C differs "
-                f"from nearby median {median:.2f} C by more than 10 C.",
-            )
-
-
-def check_stuck_sensors(df, station_id, interval_minutes, flags):
-    if df.empty:
-        return
-
-    required_duration = STUCK_DURATION
-
-    # Humidity saturation is handled separately, because values flickering
-    # between 98-100 and above 100 are evidence of a saturation fault.
-    if "rh_pct" in df.columns:
-        humidity = pd.to_numeric(df["rh_pct"], errors="coerce")
-        times = df["_corrected_timestamp"]
-
-        run = []
-
-        def finish_humidity_run(indices):
-            if not indices:
-                return
-
-            first_time = times.loc[indices[0]]
-            last_time = times.loc[indices[-1]]
-            values = humidity.loc[indices]
-
-            if (
-                last_time - first_time >= required_duration
-                and (values > 100).any()
-            ):
-                add_flag(
-                    flags, station_id, "rh_pct",
-                    first_time, last_time,
-                    "humidity sensor stuck at saturation",
-                    "exclude",
-                    (
-                        "Humidity remained at or above 98% for at least "
-                        "6 hours and included readings above 100%; "
-                        "likely saturation or sensor fault."
-                    ),
-                )
-
-        previous_time = None
-
-        for index in df.index:
-            value = humidity.loc[index]
-            timestamp = times.loc[index]
-
-            is_saturated = pd.notna(value) and value >= 98
-
-            consecutive = (
-                previous_time is not None
-                and timestamp - previous_time
-                <= pd.Timedelta(minutes=interval_minutes * 1.5)
-            )
-
-            if not is_saturated or (run and not consecutive):
-                finish_humidity_run(run)
-                run = []
-
-            if is_saturated:
-                run.append(index)
-
-            previous_time = timestamp if is_saturated else None
-
-        finish_humidity_run(run)
-
-    for channel in [
-        "temp_c", "rh_pct", "pressure_hpa", "wind_dir_deg"
-    ]:
-        if channel not in df.columns:
-            continue
-
-        values = pd.to_numeric(df[channel], errors="coerce")
-        times = df["_corrected_timestamp"]
-        run = []
-        previous_value = None
-        previous_time = None
-
-        def finish_exact_run(indices):
-            if not indices:
-                return
-
-            first_time = times.loc[indices[0]]
-            last_time = times.loc[indices[-1]]
-
-            if last_time - first_time >= required_duration:
-                value = values.loc[indices[0]]
-
-                add_flag(
-                    flags, station_id, channel,
-                    first_time, last_time,
-                    "stuck sensor", "exclude",
-                    f"{channel} remained exactly {value:g} "
-                    f"for {(last_time - first_time).total_seconds() / 3600:.2f} "
-                    "hours across consecutive readings.",
-                )
-
-        for index in df.index:
-            value = values.loc[index]
-            timestamp = times.loc[index]
-
-            if pd.isna(value) or pd.isna(timestamp):
-                finish_exact_run(run)
-                run = []
-                previous_value = None
-                previous_time = None
-                continue
-
-            consecutive = (
-                previous_time is not None
-                and timestamp - previous_time
-                <= pd.Timedelta(minutes=interval_minutes * 1.5)
-            )
-
-            # Do not report exact-value humidity runs when they are part
-            # of a saturation fault already handled above.
-            humidity_saturation = (
-                channel == "rh_pct" and value >= 98
-            )
-
-            if humidity_saturation:
-                finish_exact_run(run)
-                run = []
-                previous_value = None
-                previous_time = None
-                continue
-
-            if (
-                not run
-                or value != previous_value
-                or not consecutive
-            ):
-                finish_exact_run(run)
-                run = [index]
-            else:
-                run.append(index)
-
-            previous_value = value
-            previous_time = timestamp
-
-        finish_exact_run(run)
+    zenith = math.degrees(math.acos(cosine_zenith))
+    return 90 - zenith
 
 
 def check_sunlight_at_night(
-    df, station_id, latitude, longitude, interval_minutes, flags
+    weather, station_id, latitude, longitude, interval_minutes, flags
 ):
-    if "ghi_wm2" not in df.columns:
-        return
-
+    """Flag GHI > 20 W/m2 at night, using interval midpoint timestamps."""
     if pd.isna(latitude) or pd.isna(longitude):
         return
 
-    ghi = pd.to_numeric(df["ghi_wm2"], errors="coerce")
-    midpoint_offset = pd.Timedelta(minutes=interval_minutes / 2)
+    ordered = weather.dropna(
+        subset=["_corrected_timestamp"]
+    ).sort_values("_corrected_timestamp").copy()
 
-    night_rows = []
-
-    for index in df.index:
-        value = ghi.loc[index]
-
-        if pd.isna(value) or value <= 20:
-            continue
-
-        # Logger timestamp marks the END of the measurement interval.
-        midpoint = (
-            df.at[index, "_corrected_timestamp"] - midpoint_offset
-        )
-
-        elevation = solar_elevation_deg(
-            midpoint, latitude, longitude
-        )
-
-        if elevation < -3:
-            night_rows.append({
-                "index": index,
-                "time": df.at[index, "_corrected_timestamp"],
-                "midpoint": midpoint,
-                "ghi": float(value),
-                "elevation": elevation,
-                "day": midpoint.date(),
-            })
-
-    if not night_rows:
+    if ordered.empty:
         return
 
-    night_df = pd.DataFrame(night_rows)
+    ordered["_midpoint"] = (
+        ordered["_corrected_timestamp"]
+        - pd.Timedelta(minutes=interval_minutes / 2)
+    )
 
-    # Require at least three qualifying readings on the same UTC day.
-    for day, group in night_df.groupby("day", sort=True):
-        if len(group) < 3:
+    night_mask = []
+    for _, row in ordered.iterrows():
+        ghi = row["ghi_wm2"]
+        if pd.isna(ghi) or ghi <= 20:
+            night_mask.append(False)
+            continue
+
+        elevation = solar_elevation_deg(
+            row["_midpoint"], latitude, longitude
+        )
+        night_mask.append(elevation < -3)
+
+    ordered["_night_sunlight"] = night_mask
+    ordered["_utc_day"] = ordered["_midpoint"].dt.strftime("%Y-%m-%d")
+
+    qualifying = ordered[ordered["_night_sunlight"]]
+
+    # Require at least three qualifying readings per UTC day.
+    for _, day_group in qualifying.groupby("_utc_day"):
+        if len(day_group) < 3:
             continue
 
         add_flag(
             flags,
             station_id,
             "ghi_wm2",
-            group["time"].min(),
-            group["time"].max(),
-            "sunlight at night",
+            day_group["_corrected_timestamp"].min(),
+            day_group["_corrected_timestamp"].max(),
+            "sunlight recorded at night",
             "exclude",
-            (
-                f"{len(group)} readings that day exceeded 20 W/m2 "
-                "with midpoint solar elevation below -3 degrees; "
-                f"elevation range {group['elevation'].min():.2f} "
-                f"to {group['elevation'].max():.2f} degrees."
-            ),
+            f"{len(day_group)} readings with GHI > 20 W/m2 "
+            "while solar elevation was below -3 degrees",
         )
 
 
-def check_gps_position(
-    gps, station_id, station_lat, station_lon, flags, df
-):
-    if (
-        pd.isna(station_lat)
-        or pd.isna(station_lon)
-        or gps.empty
-    ):
+# ---------------------------------------------------------------------
+# GPS position check
+# ---------------------------------------------------------------------
+
+def check_gps_position(gps, station_row, station_id, flags, weather=None):
+    """Flag a station whose median valid GPS position is >500 m from metadata."""
+    if gps.empty:
         return
 
-    fixes = gps.dropna(subset=["lat", "lon"])
+    latitudes = pd.to_numeric(gps["lat"], errors="coerce").dropna()
+    longitudes = pd.to_numeric(gps["lon"], errors="coerce").dropna()
 
-    if fixes.empty:
+    if latitudes.empty or longitudes.empty:
         return
 
-    median_lat = float(fixes["lat"].median())
-    median_lon = float(fixes["lon"].median())
+    station_lat = pd.to_numeric(
+        pd.Series([station_row.get("lat")]), errors="coerce"
+    ).iloc[0]
+    station_lon = pd.to_numeric(
+        pd.Series([station_row.get("lon")]), errors="coerce"
+    ).iloc[0]
+
+    if pd.isna(station_lat) or pd.isna(station_lon):
+        return
+
+    median_lat = latitudes.median()
+    median_lon = longitudes.median()
 
     distance = haversine_m(
-        float(station_lat), float(station_lon),
-        median_lat, median_lon,
+        station_lat, station_lon, median_lat, median_lon
     )
 
     if distance > 500:
+        start = end = None
+        if weather is not None and not weather.empty:
+            start = weather["_corrected_timestamp"].min()
+            end = weather["_corrected_timestamp"].max()
         add_flag(
-            flags, station_id, "metadata",
-            df["_corrected_timestamp"].min() if not df.empty else pd.NaT,
-            df["_corrected_timestamp"].max() if not df.empty else pd.NaT,
+            flags,
+            station_id,
+            "metadata",
+            start,
+            end,
             "GPS position differs from station metadata",
             "correct",
-            (
-                f"Median valid GPS position is {median_lat:.6f}, "
-                f"{median_lon:.6f}; {distance:.0f} m from stations.csv "
-                f"position {float(station_lat):.6f}, "
-                f"{float(station_lon):.6f}."
-            ),
+            f"median valid GPS position {median_lat:.4f}, {median_lon:.4f} is "
+            f"{distance / 1000:.1f} km from stations.csv ({station_lat:.4f}, {station_lon:.4f}) "
+            f"and steady all period; fix the metadata, the data itself is fine.",
         )
 
 
-def check_gaps(df, station_id, interval_minutes, flags):
-    if len(df) < 2:
-        return
+# ---------------------------------------------------------------------
+# Flag filtering and merging
+# ---------------------------------------------------------------------
 
-    df = df.sort_values(
-        "_corrected_timestamp", kind="stable"
-    )
+def suppress_rh_range_flags_inside_saturation(flags):
+    """Remove RH range flags fully contained in a same-station saturation flag.
 
-    expected = pd.Timedelta(minutes=interval_minutes)
-    timestamps = df["_corrected_timestamp"].tolist()
+    A range flag is removed only when:
+      - station_id matches;
+      - both flags refer to channel rh_pct;
+      - the issue is relative humidity outside 0..100%;
+      - its start and end are both within the saturation flag's time range.
+    """
+    saturation_flags = [
+        flag for flag in flags
+        if flag["issue"] == SATURATION_ISSUE
+        and flag["channel"] == "rh_pct"
+        and flag["start_utc"] is not None
+        and flag["end_utc"] is not None
+        and not pd.isna(flag["start_utc"])
+        and not pd.isna(flag["end_utc"])
+    ]
 
-    for previous, current in zip(timestamps[:-1], timestamps[1:]):
-        delta = current - previous
+    filtered = []
 
-        if delta <= expected * 1.5:
+    for flag in flags:
+        if (
+            flag["issue"] != RH_RANGE_ISSUE
+            or flag["channel"] != "rh_pct"
+            or flag["start_utc"] is None
+            or flag["end_utc"] is None
+            or pd.isna(flag["start_utc"])
+            or pd.isna(flag["end_utc"])
+        ):
+            filtered.append(flag)
             continue
 
-        missing_start = previous + expected
-        missing_end = current - expected
+        contained = any(
+            saturation["station_id"] == flag["station_id"]
+            and saturation["channel"] == flag["channel"]
+            and saturation["start_utc"] <= flag["start_utc"]
+            and saturation["end_utc"] >= flag["end_utc"]
+            for saturation in saturation_flags
+        )
 
-        if missing_start <= missing_end:
-            add_flag(
-                flags, station_id, "all",
-                missing_start, missing_end,
-                "missing logger interval(s)", "exclude",
-                (
-                    f"Expected {interval_minutes:g}-minute sampling; "
-                    f"the gap between valid observations is "
-                    f"{delta.total_seconds() / 60:g} minutes."
-                ),
-            )
+        if not contained:
+            filtered.append(flag)
+
+    return filtered
 
 
-def merge_consecutive_flags(flags, interval_minutes):
-    """Merge nearby flags of the same issue without merging across long gaps."""
+def merge_consecutive_flags(flags, interval_minutes=10):
+    """Merge overlapping or consecutive flags with the same identity."""
     if not flags:
         return []
 
-    df = pd.DataFrame(flags, columns=OUTPUT_COLUMNS)
+    interval = pd.Timedelta(minutes=interval_minutes)
+    sortable = []
 
-    df["_start"] = pd.to_datetime(
-        df["start_utc"], errors="coerce", utc=True
-    )
-    df["_end"] = pd.to_datetime(
-        df["end_utc"], errors="coerce", utc=True
-    )
+    for flag in flags:
+        item = flag.copy()
+        item["_start"] = item.get("start_utc")
+        item["_end"] = item.get("end_utc")
+        item["_notes"] = [str(item.get("note", ""))]
+        item["_count"] = 1
+        sortable.append(item)
 
-    df["_interval"] = df["station_id"].map(
-        interval_minutes
-    ).fillna(10.0)
+    sortable.sort(key=lambda item: (
+        item["station_id"],
+        item["channel"],
+        item["issue"],
+        pd.Timestamp.min.tz_localize("UTC")
+        if item["_start"] is None or pd.isna(item["_start"])
+        else pd.Timestamp(item["_start"]),
+    ))
 
-    group_columns = [
-        "station_id", "channel", "issue", "action"
-    ]
+    merged = []
 
-    output = []
+    for item in sortable:
+        if not merged:
+            merged.append(item)
+            continue
 
-    for _, group in df.groupby(
-        group_columns, sort=False, dropna=False
-    ):
-        group = group.sort_values(
-            ["_start", "_end"], kind="stable",
-            na_position="last",
+        previous = merged[-1]
+
+        same_identity = (
+            previous["station_id"] == item["station_id"]
+            and previous["channel"] == item["channel"]
+            and previous["issue"] == item["issue"]
+            and previous["action"] == item["action"]
         )
 
-        current = None
+        previous_start = previous["_start"]
+        previous_end = previous["_end"]
+        current_start = item["_start"]
+        current_end = item["_end"]
 
-        for _, row in group.iterrows():
-            start = row["_start"]
-            end = row["_end"]
-
-            if pd.isna(start):
-                if current is not None:
-                    output.append(current)
-                    current = None
-                output.append(row.to_dict())
-                continue
-
-            if current is None:
-                current = row.to_dict()
-                current["_notes"] = [str(row["note"])]
-                continue
-
-            previous_end = current["_end"]
-            tolerance = pd.Timedelta(
-                minutes=max(
-                    float(row["_interval"]),
-                    float(current["_interval"]),
-                )
+        both_timed = all(
+            value is not None and not pd.isna(value)
+            for value in (
+                previous_start, previous_end, current_start, current_end
             )
+        )
 
-            if (
-                pd.notna(previous_end)
-                and start <= previous_end + tolerance
-            ):
-                if pd.notna(end) and (
-                    pd.isna(current["_end"])
-                    or end > current["_end"]
-                ):
-                    current["_end"] = end
-
-                note = str(row["note"])
-                if note not in current["_notes"]:
-                    current["_notes"].append(note)
-            else:
-                output.append(current)
-                current = row.to_dict()
-                current["_notes"] = [str(row["note"])]
-
-        if current is not None:
-            output.append(current)
+        if same_identity and both_timed and current_start <= previous_end + interval:
+            previous["_end"] = max(previous_end, current_end)
+            previous["_count"] += item["_count"]
+            previous["_notes"].extend(item["_notes"])
+        else:
+            merged.append(item)
 
     result = []
 
-    for row in output:
-        notes = row.get("_notes", [str(row.get("note", ""))])
+    for item in merged:
+        start = item["_start"]
+        end = item["_end"]
+        note = str(item.get("note", ""))
+
+        if item["_count"] > 1:
+            if item["issue"] == "exact duplicate row":
+                note = (
+                    "drop the repeated copy; "
+                    f"{item['_count']} repeated row(s)"
+                )
+            elif item["_notes"]:
+                unique_notes = list(dict.fromkeys(item["_notes"]))
+                if len(unique_notes) == 1:
+                    note = unique_notes[0]
+                else:
+                    note = "; ".join(unique_notes)
 
         result.append({
-            "station_id": row["station_id"],
-            "channel": row["channel"],
-            "start_utc": format_utc(row.get("_start")),
-            "end_utc": format_utc(row.get("_end")),
-            "issue": row["issue"],
-            "action": row["action"],
-            "note": "; ".join(notes),
+            "station_id": item["station_id"],
+            "channel": item["channel"],
+            "start_utc": timestamp_text(start),
+            "end_utc": timestamp_text(end),
+            "issue": item["issue"],
+            "action": item["action"],
+            "note": note,
         })
 
     return result
 
 
-def process_station(station, pack, flags):
-    station_id = str(station["station_id"]).strip()
+# ---------------------------------------------------------------------
+# Station processing and main
+# ---------------------------------------------------------------------
 
-    interval = pd.to_numeric(
-        station.get("logger_interval_min"), errors="coerce"
-    )
-
-    if pd.isna(interval) or interval <= 0:
-        add_flag(
-            flags, station_id, "metadata", pd.NaT, pd.NaT,
-            "invalid logger interval", "exclude",
-            "logger_interval_min must be positive.",
-        )
-        return
-
-    interval = float(interval)
-
-    data_path = pack / "data" / f"{station_id}.csv"
-    gps_path = pack / "gps" / f"{station_id}.nmea"
+def process_station(pack_folder, station_row):
+    station_id = str(station_row["station_id"])
+    data_path = pack_folder / "data" / f"{station_id}.csv"
+    gps_path = pack_folder / "gps" / f"{station_id}.nmea"
+    flags = []
 
     if not data_path.exists():
         add_flag(
-            flags, station_id, "all", pd.NaT, pd.NaT,
-            "missing station data file", "exclude",
-            "The station CSV file does not exist.",
+            flags, station_id, "all", None, None,
+            "missing weather data file", "exclude",
+            f"file not found: {data_path}",
         )
-        return
+        return flags
 
-    try:
-        raw = pd.read_csv(data_path)
-    except Exception as exc:
+    weather = pd.read_csv(data_path)
+
+    missing_columns = [
+        column for column in WEATHER_COLUMNS
+        if column not in weather.columns
+    ]
+    if missing_columns:
         add_flag(
-            flags, station_id, "all", pd.NaT, pd.NaT,
-            "unreadable station data file", "exclude",
-            f"Could not read station CSV: {exc}",
+            flags, station_id, "all", None, None,
+            "missing required columns", "exclude",
+            ", ".join(missing_columns),
         )
-        return
+        return flags
 
-    if "timestamp_utc" not in raw.columns:
-        add_flag(
-            flags, station_id, "metadata", pd.NaT, pd.NaT,
-            "missing timestamp column", "exclude",
-            "The required timestamp_utc column is absent.",
+    weather["timestamp_utc"] = weather["timestamp_utc"].apply(parse_utc)
+
+    for column in WEATHER_COLUMNS[1:]:
+        weather[column] = pd.to_numeric(
+            weather[column], errors="coerce"
         )
-        return
 
-    raw["_file_row"] = np.arange(len(raw))
-    raw["timestamp_utc"] = pd.to_datetime(
-        raw["timestamp_utc"], errors="coerce", utc=True
+    interval_value = pd.to_numeric(
+        pd.Series([station_row.get("logger_interval_min", 10)]),
+        errors="coerce",
+    ).iloc[0]
+    interval_minutes = (
+        int(interval_value)
+        if pd.notna(interval_value) and interval_value > 0
+        else 10
     )
-
-    for _, row in raw[raw["timestamp_utc"].isna()].iterrows():
-        add_flag(
-            flags, station_id, "all", pd.NaT, pd.NaT,
-            "invalid logger timestamp", "exclude",
-            f"CSV row {int(row['_file_row']) + 2} has an invalid timestamp.",
-        )
-
-    raw = raw[raw["timestamp_utc"].notna()].copy()
-
-    if raw.empty:
-        return
 
     gps = load_gps(gps_path)
 
-    weather_segments = split_segments(
-        raw, "timestamp_utc", "_file_row"
+    # Part 1: correct clock before duplicate, conflict, and gap checks.
+    weather = correct_clock(
+        weather, gps, station_id, interval_minutes, flags
     )
-    gps_segments_indices = split_segments(
-        gps, "logger_time", "gps_row"
+    weather = handle_duplicates_and_conflicts(
+        weather, station_id, flags
     )
-    gps_segments = [
-        gps.loc[indices].copy()
-        for indices in gps_segments_indices
-    ]
+    check_gaps(weather, station_id, interval_minutes, flags)
 
-    corrected_segments = []
-    tolerance_seconds = max(120.0, interval * 30.0)
-
-    # Clock correction occurs before duplicate/conflict detection.
-    for segment_number, indices in enumerate(weather_segments):
-        segment = raw.loc[indices].copy()
-        segment["_segment"] = segment_number
-        segment["_corrected_timestamp"] = segment["timestamp_utc"]
-
-        gps_segment = (
-            gps_segments[segment_number]
-            if segment_number < len(gps_segments)
-            else pd.DataFrame(columns=gps.columns)
-        )
-
-        offset_seconds = estimate_segment_offset(
-            segment, gps_segment, tolerance_seconds
-        )
-
-        if (
-            offset_seconds is not None
-            and abs(offset_seconds) >= 120
-        ):
-            shift_seconds = -offset_seconds
-
-            segment["_corrected_timestamp"] = (
-                segment["timestamp_utc"]
-                + pd.to_timedelta(shift_seconds, unit="s")
-            )
-
-            add_flag(
-                flags, station_id, "all",
-                segment["_corrected_timestamp"].min(),
-                segment["_corrected_timestamp"].max(),
-                "logger clock offset", "correct",
-                (
-                    f"Shifted timestamps by "
-                    f"{shift_seconds / 3600:+.2f} h "
-                    f"({shift_seconds:+.0f} seconds); median "
-                    f"logger-minus-RMC offset was "
-                    f"{offset_seconds:+.0f} seconds in clock "
-                    f"segment {segment_number + 1}."
-                ),
-            )
-
-        corrected_segments.append(segment)
-
-    if not corrected_segments:
-        return
-
-    corrected = pd.concat(
-        corrected_segments, ignore_index=True
+    # Part 2: data-quality checks on corrected timestamps.
+    check_impossible_values(weather, station_id, flags)
+    check_temperature_spikes(weather, station_id, flags)
+    check_stuck_sensors(
+        weather, station_id, interval_minutes, flags
     )
 
-    # Remove exact duplicates after clock correction.
-    original_columns = [
-        col for col in raw.columns if col != "_file_row"
-    ]
-
-    duplicate_mask = corrected.duplicated(
-        subset=original_columns, keep="first"
-    )
-
-    duplicate_indices = corrected.index[duplicate_mask].tolist()
-
-    if duplicate_indices:
-        duplicate_rows = corrected.loc[duplicate_indices].copy()
-        duplicate_rows = duplicate_rows.sort_values(
-            "_file_row", kind="stable"
-        )
-
-        groups = []
-        run = [duplicate_rows.index[0]]
-
-        for index in duplicate_rows.index[1:]:
-            if (
-                corrected.at[index, "_file_row"]
-                == corrected.at[run[-1], "_file_row"] + 1
-            ):
-                run.append(index)
-            else:
-                groups.append(run)
-                run = [index]
-
-        groups.append(run)
-
-        for run in groups:
-            add_flag(
-                flags, station_id, "all",
-                corrected.loc[run, "_corrected_timestamp"].min(),
-                corrected.loc[run, "_corrected_timestamp"].max(),
-                "exact duplicate row(s)", "correct",
-                f"drop the repeated copy; {len(run)} repeated row(s).",
-            )
-
-        corrected = corrected.drop(index=duplicate_indices).copy()
-
-    # Conflicting timestamps are evaluated using corrected UTC.
-    conflicting = corrected[
-        corrected.duplicated(
-            "_corrected_timestamp", keep=False
-        )
-    ]
-
-    for timestamp in sorted(
-        conflicting["_corrected_timestamp"].unique()
-    ):
-        timestamp = pd.Timestamp(timestamp)
-
-        add_flag(
-            flags, station_id, "all",
-            timestamp, timestamp,
-            "conflicting duplicate timestamp", "exclude",
-            "Different readings share the same corrected UTC timestamp.",
-        )
-
-    if not conflicting.empty:
-        corrected = corrected[
-            ~corrected["_corrected_timestamp"].isin(
-                conflicting["_corrected_timestamp"]
-            )
-        ].copy()
-
-    corrected = corrected.sort_values(
-        "_corrected_timestamp", kind="stable"
-    ).reset_index(drop=True)
-
-    # Part 2: single-station checks after clock fix and deduplication.
-    check_impossible_values(corrected, station_id, flags)
-    check_temperature_spikes(corrected, station_id, flags)
-
-    for _, segment in corrected.groupby("_segment", sort=False):
-        segment = segment.sort_values(
-            "_corrected_timestamp", kind="stable"
-        )
-        check_stuck_sensors(
-            segment, station_id, interval, flags
-        )
-
-    try:
-        station_lat = float(station["lat"])
-        station_lon = float(station["lon"])
-    except (ValueError, TypeError, KeyError):
-        station_lat = np.nan
-        station_lon = np.nan
+    latitude = pd.to_numeric(
+        pd.Series([station_row.get("lat")]), errors="coerce"
+    ).iloc[0]
+    longitude = pd.to_numeric(
+        pd.Series([station_row.get("lon")]), errors="coerce"
+    ).iloc[0]
 
     check_sunlight_at_night(
-        corrected, station_id,
-        station_lat, station_lon, interval, flags,
+        weather,
+        station_id,
+        latitude,
+        longitude,
+        interval_minutes,
+        flags,
     )
+    check_gps_position(gps, station_row, station_id, flags, weather)
 
-    check_gps_position(
-        gps, station_id, station_lat, station_lon,
-        flags, corrected,
-    )
-
-    # Gap checks stay within original clock segments.
-    for _, segment in corrected.groupby("_segment", sort=False):
-        check_gaps(segment, station_id, interval, flags)
+    return flags
 
 
 def main():
     if len(sys.argv) != 2:
-        print(
-            "Usage: python check.py <pack_folder>",
-            file=sys.stderr,
-        )
-        return 2
+        print("Usage: python check.py <pack_folder>", file=sys.stderr)
+        sys.exit(1)
 
-    pack = Path(sys.argv[1])
+    pack_folder = Path(sys.argv[1])
 
-    if not pack.is_dir():
-        print(f"Error: pack folder not found: {pack}", file=sys.stderr)
-        return 2
-
-    stations_path = pack / "stations.csv"
-
+    stations_path = pack_folder / "stations.csv"
     if not stations_path.exists():
         print(
-            f"Error: stations.csv not found in {pack}",
+            f"Error: stations.csv not found in {pack_folder}",
             file=sys.stderr,
         )
-        return 2
+        sys.exit(1)
 
-    try:
-        stations = pd.read_csv(stations_path)
-    except Exception as exc:
-        print(f"Error reading stations.csv: {exc}", file=sys.stderr)
-        return 2
+    stations = pd.read_csv(stations_path, dtype={"station_id": str})
 
-    required = {
-        "station_id", "logger_interval_min", "lat", "lon"
-    }
+    all_flags = []
+    for _, station_row in stations.iterrows():
+        all_flags.extend(process_station(pack_folder, station_row))
 
-    if not required.issubset(stations.columns):
-        missing = sorted(required - set(stations.columns))
-        print(
-            f"Error: stations.csv missing columns: {', '.join(missing)}",
-            file=sys.stderr,
-        )
-        return 2
+    # IMPORTANT: suppress RH out-of-range flags fully contained within
+    # a same-station/channel humidity saturation flag before merging.
+    all_flags = suppress_rh_range_flags_inside_saturation(all_flags)
 
-    flags = []
+    interval_values = pd.to_numeric(
+        stations.get(
+            "logger_interval_min",
+            pd.Series([10] * len(stations)),
+        ),
+        errors="coerce",
+    ).dropna()
 
-    for _, station in stations.iterrows():
-        station_id = str(station["station_id"]).strip()
+    default_interval = (
+        int(interval_values.median()) if not interval_values.empty else 10
+    )
 
-        if not station_id or station_id.lower() == "nan":
-            continue
+    merged_flags = merge_consecutive_flags(
+        all_flags, interval_minutes=default_interval
+    )
 
-        process_station(station, pack, flags)
+    output = pd.DataFrame(merged_flags, columns=OUTPUT_COLUMNS)
+    output.to_csv("flags.csv", index=False)
 
-    intervals = {}
-
-    for _, station in stations.iterrows():
-        station_id = str(station["station_id"]).strip()
-        interval = pd.to_numeric(
-            station["logger_interval_min"], errors="coerce"
-        )
-
-        if pd.notna(interval) and interval > 0:
-            intervals[station_id] = float(interval)
-
-    flags = merge_consecutive_flags(flags, intervals)
-
-    result = pd.DataFrame(flags, columns=OUTPUT_COLUMNS)
-
-    if not result.empty:
-        result = result.sort_values(
-            ["station_id", "start_utc", "channel", "issue"],
-            kind="stable",
-            na_position="last",
-        )
-
-    output_path = Path.cwd() / "flags.csv"
-    result.to_csv(output_path, index=False)
-
-    print(f"Wrote {len(result)} flags to {output_path}")
-    return 0
+    print(f"Wrote {len(output)} flags to flags.csv")
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
