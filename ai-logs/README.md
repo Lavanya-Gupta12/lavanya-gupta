@@ -1,2 +1,2 @@
 chatgpt link : 
-https://chatgpt.com/c/6addbf58-90a0-83ee-8201-8dfde9ecb707
+https://chatgpt.com/share/6ade4b4b-43b4-83ee-ab46-9e641221d6f5
